@@ -51,10 +51,20 @@ def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
         def __call__(self, x, indices):
             return mx.zeros((x.shape[0], self.topk, x.shape[1]), dtype=x.dtype)
 
+    from optimistic import OptimisticExperts, OptimisticStore
     experts_cls = {"stacked": StackedStreamingExperts,
-                   "noop": NoopExperts}.get(store_kind, StreamingExperts)
-    store = ExpertStore(os.path.join(repacked, "experts"),
-                        cache_bytes=int(cache_gb * 1e9))
+                   "noop": NoopExperts,
+                   "optimistic": OptimisticExperts}.get(store_kind, StreamingExperts)
+    if store_kind == "optimistic":
+        plan_path = os.path.join(os.path.dirname(__file__), "..", "logs",
+                                 "slot_plan.json")
+        plan = json.load(open(plan_path)) if os.path.exists(plan_path) else None
+        store = OptimisticStore(os.path.join(repacked, "experts"),
+                                cache_bytes=int(cache_gb * 1e9), slot_plan=plan)
+        print(f"[store] slot plan: {'measured profile' if plan else 'uniform'}")
+    else:
+        store = ExpertStore(os.path.join(repacked, "experts"),
+                            cache_bytes=int(cache_gb * 1e9))
     for i, layer in enumerate(model.layers):
         layer.ffn.experts = experts_cls(
             store, i, group_size=q["group_size"], bits=q.get("expert_bits", 4),
@@ -85,7 +95,8 @@ def main():
     ap.add_argument("--cache-gb", type=float, default=8.0)
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new", type=int, default=16)
-    ap.add_argument("--store", choices=["lru", "stacked", "noop"], default="lru")
+    ap.add_argument("--store", choices=["lru", "stacked", "noop", "optimistic"],
+                    default="lru")
     ap.add_argument("--repeat", type=int, default=1)
     args_cli = ap.parse_args()
 
@@ -95,10 +106,15 @@ def main():
     ids = tok.encode(args_cli.prompt)
     print(f"[gen] prompt: {len(ids)} tokens; cache budget {args_cli.cache_gb} GB")
 
+    from optimistic import optimistic_generate
     for run in range(args_cli.repeat):
         t0 = time.time()
-        out = greedy_generate(model, args, ids, max_new_tokens=args_cli.max_new,
-                              verbose=True)
+        if args_cli.store == "optimistic":
+            out = optimistic_generate(model, args, store, ids,
+                                      max_new_tokens=args_cli.max_new, verbose=True)
+        else:
+            out = greedy_generate(model, args, ids, max_new_tokens=args_cli.max_new,
+                                  verbose=True)
         dt = time.time() - t0
         n_new = len(out) - len(ids)
         print(f"[gen] run {run+1}: {n_new} tokens in {dt:.1f}s "
