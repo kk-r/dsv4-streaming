@@ -1,0 +1,7 @@
+repacked/
+logs/
+bench/
+deepseek-v4-mlx/
+__pycache__/
+*.pyc
+.DS_Store
