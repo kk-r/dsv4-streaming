@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import numpy as np
@@ -37,7 +38,7 @@ class LayerFile:
 class ExpertStore:
     """cache_bytes of expert blobs across all layers, global LRU."""
 
-    def __init__(self, expert_dir, cache_bytes):
+    def __init__(self, expert_dir, cache_bytes, io_threads=8):
         layout = json.load(open(os.path.join(expert_dir, "layout.json")))
         self.layers = {
             int(k): LayerFile(os.path.join(expert_dir, f"layer_{int(k):02d}.bin"), v)
@@ -47,6 +48,32 @@ class ExpertStore:
         self.cache = OrderedDict()  # (layer, expert) -> dict of mx arrays
         self.used = 0
         self.stats = defaultdict(lambda: {"hits": 0, "misses": 0, "bytes": 0})
+        self.io = ThreadPoolExecutor(max_workers=io_threads)
+
+    def get_many(self, layer, expert_ids):
+        """Fetch several experts, reading misses from SSD in parallel."""
+        st = self.stats[layer]
+        lf = self.layers[layer]
+        missing = [e for e in expert_ids if (layer, e) not in self.cache]
+        if missing:
+            blobs = list(self.io.map(lf.read_blob, missing))
+            for e, blob in zip(missing, blobs):
+                st["misses"] += 1
+                st["bytes"] += lf.stride
+                self.cache[(layer, e)] = self._decode(layer, blob)
+                self.used += lf.stride
+            while self.used > self.capacity and len(self.cache) > len(expert_ids):
+                old_key, _ = self.cache.popitem(last=False)
+                self.used -= self.layers[old_key[0]].stride
+        out = {}
+        for e in expert_ids:
+            key = (layer, e)
+            if e not in out and key in self.cache:
+                if e not in missing:
+                    st["hits"] += 1
+                self.cache.move_to_end(key)
+                out[e] = self.cache[key]
+        return out
 
     def _decode(self, layer, blob):
         lf = self.layers[layer]
@@ -125,3 +152,52 @@ class StreamingExperts:
                 row.append(self._proj(h, e, "down_proj"))
             outs.append(mx.concatenate(row, axis=0))
         return mx.stack(outs)
+
+
+class StackedStreamingExperts:
+    """Batched expert call: per visit, stack the selected experts' weights and
+    run one gather_qmm per projection (3 kernels/layer instead of 18 matmuls).
+
+    The stack is a GPU-side copy of ~85 MB per layer visit — cheap next to the
+    kernel-dispatch overhead it removes. Misses are read from SSD in parallel
+    via ExpertStore.get_many. The per-layer sync (np.asarray on the routing
+    indices) is inherent to streaming: expert ids must reach the CPU before the
+    disk can be asked for them.
+    """
+
+    def __init__(self, store: ExpertStore, layer: int, group_size=64, bits=4,
+                 limit: float = 0.0):
+        self.store, self.layer = store, layer
+        self.group_size, self.bits = group_size, bits
+        self.limit = limit
+
+    def _stack(self, entries, uniq, key):
+        return mx.stack([entries[e][key] for e in uniq])
+
+    def _qmm(self, x, w, s, b, pos):
+        return mx.gather_qmm(x, w, s, b, rhs_indices=pos, transpose=True,
+                             group_size=self.group_size, bits=self.bits)
+
+    def __call__(self, x, indices):
+        # x [tokens, dim], indices [tokens, topk] -> [tokens, topk, dim]
+        idx = np.asarray(indices)
+        toks, topk = idx.shape
+        flat = idx.reshape(-1).tolist()
+        uniq = list(dict.fromkeys(flat))
+        entries = self.store.get_many(self.layer, uniq)
+        slot = {e: i for i, e in enumerate(uniq)}
+        pos = mx.array(np.array([slot[e] for e in flat], dtype=np.int32)
+                       .reshape(toks, topk))
+
+        xe = mx.expand_dims(x, (-2, -3))  # [tokens, 1, 1, dim]
+        proj = {}
+        for p in ("gate_proj", "up_proj", "down_proj"):
+            proj[p] = tuple(self._stack(entries, uniq, f"{p}.{part}")
+                            for part in ("weight", "scales", "biases"))
+        gate = self._qmm(xe, *proj["gate_proj"], pos).astype(mx.float32)
+        up = self._qmm(xe, *proj["up_proj"], pos).astype(mx.float32)
+        if self.limit > 0:
+            up = mx.clip(up, -self.limit, self.limit)
+            gate = mx.minimum(gate, self.limit)
+        h = (mx.sigmoid(gate) * gate * up).astype(x.dtype)
+        return self._qmm(h, *proj["down_proj"], pos).squeeze(-2)

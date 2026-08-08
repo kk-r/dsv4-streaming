@@ -29,10 +29,11 @@ from deepseek_v4_mlx.config import ModelArgs          # noqa: E402
 from deepseek_v4_mlx.generate import greedy_generate, load_tokenizer  # noqa: E402
 from deepseek_v4_mlx.load import quant_predicate      # noqa: E402
 from deepseek_v4_mlx.model import Model               # noqa: E402
-from expert_store import ExpertStore, StreamingExperts  # noqa: E402
+from expert_store import (ExpertStore, StackedStreamingExperts,  # noqa: E402
+                          StreamingExperts)
 
 
-def load_streaming(repacked: str, cache_gb: float):
+def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
     cfg = json.load(open(os.path.join(repacked, "config.json")))
     args = ModelArgs.from_dict(cfg)
     q = cfg["quantization"]
@@ -42,10 +43,20 @@ def load_streaming(repacked: str, cache_gb: float):
                 class_predicate=quant_predicate(q["group_size"], q["bits"],
                                                 q.get("expert_bits")))
 
+    class NoopExperts:
+        """Diagnostic: zero expert output — isolates resident-path cost."""
+        def __init__(self, store, layer, **kw):
+            self.topk = args.n_activated_experts
+
+        def __call__(self, x, indices):
+            return mx.zeros((x.shape[0], self.topk, x.shape[1]), dtype=x.dtype)
+
+    experts_cls = {"stacked": StackedStreamingExperts,
+                   "noop": NoopExperts}.get(store_kind, StreamingExperts)
     store = ExpertStore(os.path.join(repacked, "experts"),
                         cache_bytes=int(cache_gb * 1e9))
     for i, layer in enumerate(model.layers):
-        layer.ffn.experts = StreamingExperts(
+        layer.ffn.experts = experts_cls(
             store, i, group_size=q["group_size"], bits=q.get("expert_bits", 4),
             limit=args.swiglu_limit)
 
@@ -74,17 +85,24 @@ def main():
     ap.add_argument("--cache-gb", type=float, default=8.0)
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new", type=int, default=16)
+    ap.add_argument("--store", choices=["lru", "stacked", "noop"], default="lru")
+    ap.add_argument("--repeat", type=int, default=1)
     args_cli = ap.parse_args()
 
-    model, args, store = load_streaming(args_cli.repacked, args_cli.cache_gb)
+    model, args, store = load_streaming(args_cli.repacked, args_cli.cache_gb,
+                                        args_cli.store)
     tok = load_tokenizer(args_cli.repacked)
     ids = tok.encode(args_cli.prompt)
     print(f"[gen] prompt: {len(ids)} tokens; cache budget {args_cli.cache_gb} GB")
 
-    t0 = time.time()
-    out = greedy_generate(model, args, ids, max_new_tokens=args_cli.max_new,
-                          verbose=True)
-    dt = time.time() - t0
+    for run in range(args_cli.repeat):
+        t0 = time.time()
+        out = greedy_generate(model, args, ids, max_new_tokens=args_cli.max_new,
+                              verbose=True)
+        dt = time.time() - t0
+        n_new = len(out) - len(ids)
+        print(f"[gen] run {run+1}: {n_new} tokens in {dt:.1f}s "
+              f"-> {n_new/dt:.2f} tok/s | store {store.summary()}")
     new = out[len(ids):]
     print(f"\n=== output ===\n{tok.decode(out)}\n==============")
     print(f"[gen] {len(new)} new tokens in {dt:.1f}s -> {len(new)/dt:.2f} tok/s "
