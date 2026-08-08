@@ -30,9 +30,10 @@ from deepseek_v4_mlx.generate import greedy_generate, load_tokenizer  # noqa: E4
 from deepseek_v4_mlx.load import quant_predicate      # noqa: E402
 from deepseek_v4_mlx.model import Model               # noqa: E402
 from expert_store import ExpertStore, StreamingExperts  # noqa: E402
+from slot_store import SlotExpertStore, SlotStreamingExperts  # noqa: E402
 
 
-def load_streaming(repacked: str, cache_gb: float):
+def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
     cfg = json.load(open(os.path.join(repacked, "config.json")))
     args = ModelArgs.from_dict(cfg)
     q = cfg["quantization"]
@@ -42,10 +43,13 @@ def load_streaming(repacked: str, cache_gb: float):
                 class_predicate=quant_predicate(q["group_size"], q["bits"],
                                                 q.get("expert_bits")))
 
-    store = ExpertStore(os.path.join(repacked, "experts"),
-                        cache_bytes=int(cache_gb * 1e9))
+    store_cls, experts_cls = ((SlotExpertStore, SlotStreamingExperts)
+                              if store_kind == "slot"
+                              else (ExpertStore, StreamingExperts))
+    store = store_cls(os.path.join(repacked, "experts"),
+                      cache_bytes=int(cache_gb * 1e9))
     for i, layer in enumerate(model.layers):
-        layer.ffn.experts = StreamingExperts(
+        layer.ffn.experts = experts_cls(
             store, i, group_size=q["group_size"], bits=q.get("expert_bits", 4),
             limit=args.swiglu_limit)
 
@@ -74,9 +78,11 @@ def main():
     ap.add_argument("--cache-gb", type=float, default=8.0)
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new", type=int, default=16)
+    ap.add_argument("--store", choices=["lru", "slot"], default="lru")
     args_cli = ap.parse_args()
 
-    model, args, store = load_streaming(args_cli.repacked, args_cli.cache_gb)
+    model, args, store = load_streaming(args_cli.repacked, args_cli.cache_gb,
+                                        args_cli.store)
     tok = load_tokenizer(args_cli.repacked)
     ids = tok.encode(args_cli.prompt)
     print(f"[gen] prompt: {len(ids)} tokens; cache budget {args_cli.cache_gb} GB")
