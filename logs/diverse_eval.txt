@@ -1,0 +1,14 @@
+Diverse-workload eval — 8 prompts, persistent cache (8 GB budget), max_new=48
+
+ # domain       tok/s   hit%  GBread  miss distinct    new cumDist  output (first 60 chars)
+----------------------------------------------------------------------------------------------------------------------------------
+ 1 factual       2.29  52.9%  106.68  7536     3905   3905    3905  '",\n    "context": "The tallest mountain in the world is Moun'
+ 2 coding        2.30  53.6%  110.03  7773     4260   2121    6026  ' ...</code></pre>\n    </div>\n</div>\n\n<div class="note note-w'
+ 3 math          1.58  59.4%  137.83  9737     4482   1137    7163  '</think>Step 1: Calculate the distance traveled in the first'
+ 4 creative      1.74  47.4%  124.87  8821     3988    887    8050  ' "Dear Keeper, I am writing to you from the future. I know t'
+ 5 translation   1.52  57.1%   89.20  6301     3822    393    8443  '",\n    "response": "Il fait beau aujourd\'hui, alors nous mar'
+ 6 science       2.00  49.1%  119.01  8407     4139    389    8832  ' Use analogies to make it relatable.", "weight": null, "orig'
+ 7 history       1.82  49.0%  117.34  8289     3841    220    9052  "', 'Augustus (also known as Octavian) was the first emperor "
+ 8 casual        1.59  52.6%  121.17  8560     4499    292    9344  '",\n    "comments": [\n        {\n            "level": 0,\n     '
+----------------------------------------------------------------------------------------------------------------------------------
+overall hit rate 52.9%  total read 926.1 GB  total misses (incl. re-reads of evicted) 65424  distinct experts over all 8 prompts 9344  cache used 8.0 GB  peak mem 17.8 GB
