@@ -1,0 +1,60 @@
+DeepSeek-V4-Flash SSD expert streaming - expert-cache size sweep
+prompt : 'What is the tallest mountain in the world, and how tall is it?'
+config : --store lru --max-new 24, one separate process per run (cold cache)
+machine: M5 Pro 64 GB, iogpu.wired_limit_mb=57344
+
+SUMMARY (settled passes: pass2-rev, pass3-fwd, replicates)
+ cache  tok/s med  tok/s best  tok/s worst   n  hit_rate    hits  misses  read_gb  peak_gb
+------------------------------------------------------------------------------------------
+    4G       2.00        2.01         1.97   3     0.434    4254    5550     78.6     13.7
+    8G       2.04        2.08         0.03   5     0.507    4967    4837     68.5     17.7  <-- peak
+   16G       1.57        1.79         1.35   2     0.587    5759    4045     57.3     25.7
+   24G       1.12        1.20         1.05   2     0.632    6199    3605     51.0     33.7
+   32G       1.23        1.24         1.21   2     0.669    6562    3242     45.9     41.7
+
+PEAK THROUGHPUT: 2.04 tok/s at 8 GB cache
+32 GB cache: 1.23 tok/s at hit rate 0.669
+-> 1.67x faster with a 8 GB cache despite +0.163 lower hit rate.
+
+ALL RUNS IN ORDER (swap = sysctl vm.swapusage used-MB before -> after)
+       pass  cache   tok/s    gen_s  hit_rate  read_gb  peak_gb    swap before->after MB     status
+---------------------------------------------------------------------------------------------------
+  pass1-fwd     4G    1.61     14.9     0.434     78.6     13.7             1520 -> 1520         ok
+  pass1-fwd     8G    0.81     29.6     0.507     68.5     17.7             1520 -> 1520         ok
+  pass1-fwd    16G    0.84     28.6     0.587     57.3     25.7             1520 -> 1520         ok
+  pass1-fwd    24G    0.92     26.2     0.632     51.0     33.7             1520 -> 3591         ok
+  pass1-fwd    32G    1.09     22.1     0.669     45.9     41.7             3591 -> 6657         ok
+  pass2-rev    32G    1.24     19.4     0.669     45.9     41.7             6569 -> 7426         ok
+  pass2-rev    24G    1.20     20.0     0.632     51.0     33.7             7426 -> 7330         ok
+  pass2-rev    16G    1.79     13.4     0.587     57.3     25.7             7330 -> 7306         ok
+  pass2-rev     8G    2.07     11.6     0.507     68.5     17.7             7306 -> 7282         ok
+  pass2-rev     4G    2.01     11.9     0.434     78.6     13.7             7274 -> 7186         ok
+  pass3-fwd     4G    2.00     12.0     0.434     78.6     13.7             7146 -> 7098         ok
+  pass3-fwd     8G    0.03    726.4     0.507     68.5     17.7             7090 -> 6898         ok
+  pass3-fwd    16G    1.35     17.8     0.587     57.3     25.7             6898 -> 6826         ok
+  pass3-fwd    24G    1.05     22.9     0.632     51.0     33.7             6826 -> 6818         ok
+  pass3-fwd    32G    1.21     19.9     0.669     45.9     41.7             6818 -> 6956         ok
+ replicate1     8G    2.04     11.8     0.507     68.5     17.7             6924 -> 6820         ok
+ replicate2     8G    2.03     11.8     0.507     68.5     17.7             6820 -> 6668         ok
+ replicate3     8G    2.08     11.5     0.507     68.5     17.7             6668 -> 6660         ok
+ replicate4     4G    1.97     12.2     0.434     78.6     13.7             6660 -> 6628         ok
+
+NOTES
+1. Throughput falls as the cache grows. Hit rate rises monotonically with
+   cache size (0.434 @4G -> 0.669 @32G) but tok/s moves the other way past
+   8 GB: the extra hits do not pay for the memory pressure they create.
+2. Hits/misses/read_gb are deterministic per cache size - every run of a
+   given size did byte-identical work and produced identical output text.
+   Only wall time varies, so all timing differences are system effects.
+3. pass1-fwd is contaminated: swap grew 1520 -> 6657 MB during it, driven by
+   the 24 GB and 32 GB runs. Swap never recovered afterwards (stayed ~7 GB
+   for the rest of the sweep). Small-cache runs did not grow swap.
+4. One transient collapse observed: pass3-fwd @8 GB took 726.4 s for work
+   that takes ~11.7 s (62x), at only 17.7 GB peak memory. Three immediate
+   replicates at 8 GB returned 2.04/2.03/2.08 tok/s, so the collapse is a
+   sporadic system-level I/O stall, NOT a property of any cache size.
+5. 4 GB and 8 GB are within noise of each other (2.00 vs 2.04 median, best
+   2.01 vs 2.08): the optimum is a plateau at 4-8 GB, not a sharp peak.
+   The clear signal is the decline from 16 GB upward.
+6. Baselines for context: llama.cpp CPU-only 1.56-2.0 tok/s; the earlier
+   40 GB-cache diverse-prompt run managed 0.05 tok/s on the same prompt.
