@@ -87,6 +87,15 @@ class ExpertStore:
         """Fetch several experts, reading misses from SSD in parallel."""
         st = self.stats[layer]
         lf = self.layers[layer]
+        # Mark this batch's already-cached experts most-recent BEFORE inserting
+        # misses: the eviction loop below pops from the LRU front, and on a warm
+        # full cache it could otherwise evict a blob this same batch is about to
+        # use (out{} would then silently omit it -> KeyError downstream). First
+        # hit in practice: a server prefilling request N+1 over request N's cache.
+        for e in expert_ids:
+            key = (layer, e)
+            if key in self.cache:
+                self.cache.move_to_end(key)
         missing = [e for e in expert_ids if (layer, e) not in self.cache]
         if missing:
             read = lf.read_blob_nocache if self.prefill_nocache else lf.read_blob

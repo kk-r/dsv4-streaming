@@ -1,0 +1,50 @@
+2026-08-12 15:27:12
+serve.py smoke test
+{"id":"chatcmpl-eb51ef1277094374b120218d","object":"chat.completion","created":1786528661,"model":"deepseek-v4-flash-streaming","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":1,"total_tokens":15}}
+HTTP 200 total 3.902809s
+[serve] chat.completion: prefill 3.5s (14 tok), decode 2.37 tok/s (1 tok) | store {'hits': 41, 'misses': 1854, 'hit_rate': 0.0216, 'read_gb': 26.24, 'cached_gb': 8.0} | peak 18.2 GB
+--- streaming request:
+15:31:52 fixed expert_store.get_many warm-prefill eviction bug (KeyError); restarting
+=== REQUEST 1 (non-streaming, cold) ===
+{"id":"chatcmpl-577508f1b96b40e09481fce9","object":"chat.completion","created":1786528930,"model":"deepseek-v4-flash-streaming","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":1,"total_tokens":15}}
+HTTP 200 total 4.029850s
+[serve] chat.completion: prefill 3.6s (14 tok), decode 2.25 tok/s (1 tok) | store {'hits': 41, 'misses': 1854, 'hit_rate': 0.0216, 'read_gb': 26.24, 'cached_gb': 8.0} | peak 18.2 GB
+=== REQUEST 2 (streaming, warm cache — the previously failing path) ===
+   0.74  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}
+   9.45  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {"content": "The"}, "finish_reason": null}]}
+  10.60  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {"content": " sky"}, "finish_reason": null}]}
+  ...
+  22.34  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {"content": " wavelengths"}, "finish_reason": null}]}
+  23.81  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {"content": "."}, "finish_reason": null}]}
+  23.81  data: {"id": "chatcmpl-cfd426a29c344b34a6e14080", "object": "chat.completion.chunk", "created": 1786528940, "model": "deepseek-v4-flash-streaming", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 16, "completion_tokens": 19, "total_tokens": 35}}
+  23.81  data: [DONE]
+[serve] chat.completion.chunk: prefill 6.1s (16 tok), decode 1.12 tok/s (19 tok) | store {'hits': 2519, 'misses': 6190, 'hit_rate': 0.2892, 'read_gb': 87.62, 'cached_gb': 8.0} | peak 18.7 GB
+=== REQUEST 3 (non-streaming repeat of request 1 — warm comparison) ===
+{"id":"chatcmpl-a0dea96dd2a54aa6b6c36811","object":"chat.completion","created":1786528985,"model":"deepseek-v4-flash-streaming","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":1,"total_tokens":15}}
+HTTP 200 total 8.417565s
+[serve] chat.completion: prefill 6.6s (14 tok), decode 0.56 tok/s (1 tok) | store {'hits': 2596, 'misses': 8008, 'hit_rate': 0.2448, 'read_gb': 113.36, 'cached_gb': 8.0} | peak 18.7 GB
+=== REQUEST 4 (replicate of request 3) ===
+{"id":"chatcmpl-0a25043a8b1d439592eb03af","object":"chat.completion","created":1786529007,"model":"deepseek-v4-flash-streaming","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":1,"total_tokens":15}}
+HTTP 200 total 9.806391s
+[serve] chat.completion: prefill 8.1s (14 tok), decode 0.58 tok/s (1 tok) | store {'hits': 2659, 'misses': 9840, 'hit_rate': 0.2127, 'read_gb': 139.29, 'cached_gb': 8.0} | peak 18.7 GB
+15:34:09 clean shutdown: SIGTERM, no orphan processes, port 8399 free
+
+=== SUMMARY (2026-08-12, M5 Pro 64GB, caffeinate -i, --cache-gb 8, chat mode) ===
+startup: model loaded ~1-2.5 s, READY line printed when socket bound
+req1 non-stream cold : HTTP 200, "4", 4.03 s total (prefill 3.6 s, 14 tok; 1 gen tok)
+req2 stream warm     : 19 tok, first content delta at 9.4 s (prefill 6.1 s),
+                       deltas every ~0.7-0.9 s = 1.12 tok/s decode, ends
+                       finish_reason=stop + usage + [DONE]; 22 SSE lines
+req3 non-stream warm : HTTP 200, "4", 8.42 s (prefill 6.6 s)
+req4 replicate       : HTTP 200, "4", 9.81 s (prefill 8.1 s)
+peak mem 18.7 GB; store cumulative 139 GB read over 4 requests
+NOTE: warm repeats REGRESS (4.0 -> 8.4 -> 9.8 s on identical work). Delta
+counters show ~1830 fresh misses (~26 GB) per identical repeat, near-zero LRU
+hits: per-prompt working set >> 8 GB budget, and cumulative streaming churns
+the page cache. Matches README's open decode-after-prefill finding; not a
+server-level defect. Single timings on this machine vary ~2x (README lesson 8).
+BUG FOUND+FIXED during validation: expert_store.get_many could evict a blob
+needed by the same batch on a warm full cache (KeyError in _stack). serve.py
+was the first warm-cache get_many workload. Fix: move_to_end in-batch hits
+before eviction. chat.py/ppl paths unaffected (cold-cache or zero-hit).
+shutdown: SIGTERM -> uvicorn graceful exit, no orphans, port freed.
