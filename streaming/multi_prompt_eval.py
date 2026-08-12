@@ -45,6 +45,41 @@ PROMPTS = [
 ]
 
 
+class TouchTracker:
+    """Records distinct (layer, expert) keys touched, per prompt and overall.
+
+    At small cache budgets a "miss" can be a re-read of an evicted expert, so
+    miss counts overstate the number of distinct experts a prompt touches, and
+    cumulative misses cannot answer "did the cache warm across prompts". This
+    wraps the store's fetch methods (one set-add per expert visit, ~13k per
+    prompt — negligible) to measure both directly.
+    """
+
+    def __init__(self, store):
+        self.prompt = set()
+        self.all = set()
+        orig_get, orig_many = store.get, store.get_many
+
+        def get(layer, expert_id):
+            self.prompt.add((layer, expert_id))
+            return orig_get(layer, expert_id)
+
+        def get_many(layer, expert_ids):
+            self.prompt.update((layer, e) for e in expert_ids)
+            return orig_many(layer, expert_ids)
+
+        store.get, store.get_many = get, get_many
+
+    def start_prompt(self):
+        self.prompt = set()
+
+    def end_prompt(self):
+        """-> (distinct this prompt, of those unseen before, cumulative)."""
+        fresh = len(self.prompt - self.all)
+        self.all |= self.prompt
+        return len(self.prompt), fresh, len(self.all)
+
+
 def stats_snapshot(store):
     return {
         "hits": sum(s["hits"] for s in store.stats.values()),
@@ -68,16 +103,19 @@ def main():
     model, args, store = load_streaming(args_cli.repacked, args_cli.cache_gb,
                                         "lru")
     tok = load_tokenizer(args_cli.repacked)
+    tracker = TouchTracker(store)
 
     results = []
     for i, (domain, prompt) in enumerate(PROMPTS, 1):
         ids = tok.encode(prompt)
         before = stats_snapshot(store)
+        tracker.start_prompt()
         t0 = time.time()
         out = greedy_generate(model, args, ids,
                               max_new_tokens=args_cli.max_new, verbose=False)
         dt = time.time() - t0
         after = stats_snapshot(store)
+        distinct, fresh, cum_distinct = tracker.end_prompt()
 
         n_new = len(out) - len(ids)
         d_hits = after["hits"] - before["hits"]
@@ -93,13 +131,18 @@ def main():
             "hits": d_hits, "misses": d_miss, "hit_rate": round(rate, 4),
             "gb_read": round(d_gb, 2),
             "cum_misses": after["misses"],
+            "distinct_experts": distinct,
+            "new_distinct_experts": fresh,
+            "cum_distinct_experts": cum_distinct,
             "cached_gb": round(store.used / 1e9, 2),
             "output_head": text[:60],
+            "output_full": text,
         }
         results.append(rec)
         print(f"[{i}/8] {domain:11s} {n_new} tok in {dt:.1f}s "
               f"-> {rec['tok_s']:.2f} tok/s | hit {rate:.3f} "
               f"({d_hits}h/{d_miss}m, {d_gb:.1f} GB) | "
+              f"distinct {distinct} ({fresh} new) | "
               f"cache {rec['cached_gb']:.1f} GB | {text[:60]!r}", flush=True)
 
     total = stats_snapshot(store)
@@ -113,6 +156,7 @@ def main():
         "cached_gb_final": round(store.used / 1e9, 2),
         "peak_mem_gb": round(mx.get_peak_memory() / 1e9, 2),
         "active_mem_gb": round(mx.get_active_memory() / 1e9, 2),
+        "distinct_experts_all_prompts": len(tracker.all),
     }
 
     json.dump({"summary": summary, "prompts": results},
@@ -123,19 +167,24 @@ def main():
         f"({args_cli.cache_gb:.0f} GB budget), max_new={args_cli.max_new}",
         "",
         f"{'#':>2} {'domain':11s} {'tok/s':>6} {'hit%':>6} {'GBread':>7} "
-        f"{'miss':>5} {'cumMiss':>7}  output (first 60 chars)",
-        "-" * 110,
+        f"{'miss':>5} {'distinct':>8} {'new':>6} {'cumDist':>7}  "
+        f"output (first 60 chars)",
+        "-" * 130,
     ]
     for r in results:
         lines.append(
             f"{r['idx']:>2} {r['domain']:11s} {r['tok_s']:>6.2f} "
             f"{100*r['hit_rate']:>5.1f}% {r['gb_read']:>7.2f} "
-            f"{r['misses']:>5} {r['cum_misses']:>7}  {r['output_head']!r}")
+            f"{r['misses']:>5} {r['distinct_experts']:>8} "
+            f"{r['new_distinct_experts']:>6} {r['cum_distinct_experts']:>7}  "
+            f"{r['output_head']!r}")
     lines += [
-        "-" * 110,
+        "-" * 130,
         f"overall hit rate {100*summary['overall_hit_rate']:.1f}%  "
         f"total read {summary['total_gb_read']:.1f} GB  "
-        f"unique experts (cum misses) {summary['total_misses']}  "
+        f"total misses (incl. re-reads of evicted) {summary['total_misses']}  "
+        f"distinct experts over all 8 prompts "
+        f"{summary['distinct_experts_all_prompts']}  "
         f"cache used {summary['cached_gb_final']:.1f} GB  "
         f"peak mem {summary['peak_mem_gb']:.1f} GB",
     ]

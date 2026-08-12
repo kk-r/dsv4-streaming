@@ -119,8 +119,11 @@ class ExpertStore:
 class StreamingExperts:
     """Drop-in for the SwitchGLU expert call: (x, indices) -> [tokens, topk, dim].
 
-    v0 computes per selected expert with mx.quantized_matmul on the expert's own
-    slices. Correct for any batch; efficient only for small ones — decode first.
+    Dispatches on batch size: a single token (decode) runs the per-expert
+    quantized_matmul loop below, which measures faster at batch 1 because it
+    avoids the stacking copies; more than one token (prefill) delegates to
+    StackedStreamingExperts, whose gather_qmm path batches all of a layer's
+    visits into 3 kernels and reads misses from SSD in parallel via get_many.
     """
 
     def __init__(self, store: ExpertStore, layer: int, group_size=64, bits=4,
@@ -128,6 +131,8 @@ class StreamingExperts:
         self.store, self.layer = store, layer
         self.group_size, self.bits = group_size, bits
         self.limit = limit
+        self._stacked = StackedStreamingExperts(store, layer, group_size=group_size,
+                                                bits=bits, limit=limit)
 
     def _proj(self, x, e, p):
         return mx.quantized_matmul(
@@ -136,6 +141,8 @@ class StreamingExperts:
 
     def __call__(self, x, indices):
         # x [tokens, dim], indices [tokens, topk] -> [tokens, topk, dim]
+        if x.shape[0] > 1:          # prefill: batch the visits through gather_qmm
+            return self._stacked(x, indices)
         idx = np.asarray(indices)
         outs = []
         for t in range(idx.shape[0]):
