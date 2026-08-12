@@ -1,0 +1,38 @@
+swap before: total = 9216.00M  used = 7590.38M  free = 1625.62M  (encrypted)
+=== ppl_streaming start 2026-08-12 14:43:24 ===
+corpus /Users/kk/work/research/dsv4-streaming/streaming/../logs/ppl_corpus.npy (200,000 tokens, 195 windows available); running first 8 windows x 1024 tokens; cache 8.0 GB, store lru
+[load] done in 2.1s
+[win 1/8] nll_sum 1439.37 over 1023 tok  ppl 4.0837  cumulative ppl 4.0837  277s (3.70 tok/s)  store {'hits': 0, 'misses': 8873, 'hit_rate': 0.0, 'read_gb': 125.6, 'cached_gb': 8.0}  mem peak 24.1 GB
+[win 2/8] nll_sum 1133.07 over 1023 tok  ppl 3.0271  cumulative ppl 3.5159  307s (3.34 tok/s)  store {'hits': 0, 'misses': 17995, 'hit_rate': 0.0, 'read_gb': 254.73, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 3/8] nll_sum 953.53 over 1023 tok  ppl 2.5398  cumulative ppl 3.1547  306s (3.34 tok/s)  store {'hits': 0, 'misses': 26664, 'hit_rate': 0.0, 'read_gb': 377.45, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 4/8] nll_sum 1152.75 over 1023 tok  ppl 3.0859  cumulative ppl 3.1374  253s (4.06 tok/s)  store {'hits': 0, 'misses': 35470, 'hit_rate': 0.0, 'read_gb': 502.11, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 5/8] nll_sum 1156.16 over 1023 tok  ppl 3.0962  cumulative ppl 3.1291  262s (3.91 tok/s)  store {'hits': 0, 'misses': 44142, 'hit_rate': 0.0, 'read_gb': 624.86, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 6/8] nll_sum 1639.95 over 1023 tok  ppl 4.9683  cumulative ppl 3.3797  259s (3.96 tok/s)  store {'hits': 0, 'misses': 53214, 'hit_rate': 0.0, 'read_gb': 753.29, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 7/8] nll_sum 1929.76 over 1023 tok  ppl 6.5954  cumulative ppl 3.7184  273s (3.75 tok/s)  store {'hits': 0, 'misses': 62643, 'hit_rate': 0.0, 'read_gb': 886.76, 'cached_gb': 8.0}  mem peak 24.6 GB
+[win 8/8] nll_sum 1836.28 over 1023 tok  ppl 6.0194  cumulative ppl 3.9492  293s (3.50 tok/s)  store {'hits': 0, 'misses': 71826, 'hit_rate': 0.0, 'read_gb': 1016.75, 'cached_gb': 8.0}  mem peak 24.6 GB
+[done] aggregate ppl 3.9492 over 8,184 scored tokens (8 windows x 1024)  total 2229s (3.67 tok/s incl load-excluded)
+[json] {"windows": 8, "seq": 1024, "cache_gb": 8.0, "window_nll": [1439.366943359375, 1133.068115234375, 953.52685546875, 1152.7479248046875, 1156.1636962890625, 1639.9454345703125, 1929.7628173828125, 1836.2760009765625], "window_tok": [1023, 1023, 1023, 1023, 1023, 1023, 1023, 1023], "ppl": 3.949213114377729, "seconds": 2229.427810907364}
+exit code: 0
+swap after: total = 30720.00M  used = 25193.44M  free = 5526.56M  (encrypted)
+--- summary (2026-08-12) ---
+Setup: teacher-forced ppl through the SSD-streaming path (load_streaming, repacked/,
+store=lru, cache 8 GB), corpus built by the exact ppl_corpus.py pipeline
+(wikitext-2-raw-v1 test parquet, non-empty chunks joined "\n\n", bundled V3 tokenizer,
+first 200k tokens -> 195 windows x 1024, scored 1023/window — matches pipenetwork's
+199,485-token construction). Script: streaming/ppl_streaming.py (windowing + NLL
+identical to deepseek-v4-mlx/scripts/ppl_large.py).
+Result: PARTIAL CORPUS — windows 1-8 of 195 only (8,184 scored tokens).
+Per-window ppl: 4.0837 3.0271 2.5398 3.0859 3.0962 4.9683 6.5954 6.0194
+Aggregate ppl (windows 1-8): 3.9492. Published full-corpus (195 windows): 6.1262.
+NOT directly comparable (different window subsets; per-window spread here is
+2.54-6.60). Windows 7-8 (6.60, 6.02) straddle the published mean; the aggregate
+deviation is DOWNWARD (lower NLL), which a streaming/dequant numerics bug cannot
+produce — corruption raises NLL. No degenerate values, no spikes, cumulative ppl
+stable. Verdict: consistent with a numerically transparent streaming path; no
+evidence of a streaming-path bug. A full 195-window run (~17 h at 3.67 tok/s
+observed) would give the directly comparable number.
+Throughput: 3.67 tok/s teacher-forced prefill (253-307 s/window), peak MLX mem
+24.6 GB, LRU hits 0 (working set per 1024-token window >> 8 GB; all reads served
+by page cache/SSD), 1016.75 GB total read.
+Swap note: ambient swap grew 7.6 GB used (9 GB total) -> 25.2 GB used (30.7 GB
+total) over the run; ppl is timing-insensitive so this does not affect the result.
