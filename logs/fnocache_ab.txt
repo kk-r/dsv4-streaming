@@ -1,0 +1,38 @@
+# F_NOCACHE prefill A/B — 2026-08-12
+# Prompt: "Summarize the following document:\n\n" + README.md lines 1-6 + first 180 chars of line 7
+# 316 prompt tokens (chat encoding). Command: caffeinate -i python3 streaming/chat.py --cache-gb 8 --prompt "$(cat long_prompt.txt)" --max-new 100
+# A = DSV4_PREFILL_NOCACHE=0 (control, page-cached prefill) ; B = default (F_NOCACHE prefill)
+
+[A] control, DSV4_PREFILL_NOCACHE=0 (banner: "prefill (get_many) reads: page-cached")
+    prefill 136.1s (316 tok), decode 0.37 tok/s (100 tok), peak 23.9 GB
+    store: hits 11825, misses 21169, hit_rate 0.3584, read 299.66 GB
+    swap before: total=10240.00M used=8892.81M
+    swap after:  total=34816.00M used=22861.44M   (delta used +13968.6M)
+    baseline check: within ~25% of expected (140-155s / 0.30 tok/s) -> proceed
+
+[B1] treatment, default env (banner: "prefill (get_many) reads: F_NOCACHE")
+    prefill 237.8s (316 tok), decode 0.25 tok/s (100 tok), peak 23.9 GB
+    store: hits 11825, misses 21169, hit_rate 0.3584, read 299.66 GB (identical to A)
+    swap before: total=16384.00M used=15078.75M
+    swap after:  total=34816.00M used=14336.75M   (delta used -742.0M)
+
+[identity] A vs B1 generated text (stdout minus [bracketed] status lines): byte-identical, 354 bytes each
+
+[B2] treatment, default env (banner: "prefill (get_many) reads: F_NOCACHE")
+    prefill 127.5s (316 tok), decode 0.38 tok/s (100 tok), peak 23.9 GB
+    store: hits 11825, misses 21169, hit_rate 0.3584, read 299.66 GB (identical again)
+    swap before: total=13312.00M used=11871.25M
+    swap after:  total=28672.00M used=14355.00M   (delta used +2483.8M)
+
+[identity] A vs B2 generated text: byte-identical
+[note] B1 vs B2 variance is large (prefill 237.8 vs 127.5 s; decode 0.25 vs 0.38).
+       Machine swap state differed across all runs' starts (8.9G / 15.1G / 11.9G used).
+
+[sanity] short prompt "Why is the sky blue?", treatment default (F_NOCACHE), --max-new 100
+    prefill 10.0s (10 tok), decode 1.07 tok/s (100 tok), peak 18.1 GB
+    store: hits 12842, misses 14396, hit_rate 0.4715, read 203.79 GB
+    swap before: used=14122.38M ; after: used=13778.38M (delta -344.0M)
+
+[verdict] Decode after long prefill did NOT recover under F_NOCACHE: 0.25 / 0.38 tok/s
+    vs control 0.37 tok/s (target was ~0.96). Prefill: 237.8 / 127.5 s vs control 136.1 s.
+    Outputs byte-identical across A/B1/B2. Recommendation: don't ship.

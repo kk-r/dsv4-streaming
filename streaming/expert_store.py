@@ -13,6 +13,7 @@ says the cache actually works.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from collections import OrderedDict, defaultdict
@@ -23,10 +24,23 @@ import numpy as np
 
 NP_DTYPE = {"U32": np.uint32, "BF16": np.uint16, "F16": np.float16, "F32": np.float32}
 
+F_NOCACHE = 48  # macOS fcntl(2): bypass the unified buffer cache on this fd
+
 
 class LayerFile:
+    """One per-layer blob file, held open on two descriptors.
+
+    self.f goes through the page cache — the decode path depends on the OS
+    caching recently read blobs (see README, cache-size sweep). self.fd_nocache
+    has F_NOCACHE set: prefill streams >200 GB of misses through get_many, and
+    routing those reads here keeps them from evicting the file pages decode
+    needs. Blobs are 16 KB-aligned fixed stride, so nocache preads stay aligned.
+    """
+
     def __init__(self, path, spec):
         self.f = open(path, "rb", buffering=0)
+        self.fd_nocache = os.open(path, os.O_RDONLY)
+        fcntl.fcntl(self.fd_nocache, F_NOCACHE, 1)
         self.stride = spec["stride"]
         self.n_experts = spec["n_experts"]
         self.slices = spec["slices"]
@@ -34,11 +48,15 @@ class LayerFile:
     def read_blob(self, expert_id):
         return os.pread(self.f.fileno(), self.stride, expert_id * self.stride)
 
+    def read_blob_nocache(self, expert_id):
+        return os.pread(self.fd_nocache, self.stride, expert_id * self.stride)
+
 
 class ExpertStore:
     """cache_bytes of expert blobs across all layers, global LRU."""
 
-    def __init__(self, expert_dir, cache_bytes, io_threads=8):
+    def __init__(self, expert_dir, cache_bytes, io_threads=8,
+                 prefill_nocache: bool | None = None):
         layout = json.load(open(os.path.join(expert_dir, "layout.json")))
         self.layers = {
             int(k): LayerFile(os.path.join(expert_dir, f"layer_{int(k):02d}.bin"), v)
@@ -49,6 +67,21 @@ class ExpertStore:
         self.used = 0
         self.stats = defaultdict(lambda: {"hits": 0, "misses": 0, "bytes": 0})
         self.io = ThreadPoolExecutor(max_workers=io_threads)
+        # Route get_many (the prefill path) through the F_NOCACHE descriptor so
+        # a long prefill cannot evict the page-cache blobs decode relies on.
+        # get (the decode path) always uses the cached descriptor. Blobs fetched
+        # by get_many still land in the MLX-side LRU either way, so prefill's
+        # own intra-prompt reuse is unaffected; only OS-level caching of
+        # prefill-read file pages is suppressed. Default on; disable with
+        # DSV4_PREFILL_NOCACHE=0 or prefill_nocache=False.
+        if prefill_nocache is None:
+            # Default OFF: the A/B (logs/fnocache_ab.txt) measured no decode
+            # recovery and up to +75% prefill cost. Kept behind the flag for
+            # re-testing on a quiet machine.
+            prefill_nocache = os.environ.get("DSV4_PREFILL_NOCACHE", "0") == "1"
+        self.prefill_nocache = prefill_nocache
+        print(f"[store] prefill (get_many) reads: "
+              f"{'F_NOCACHE' if self.prefill_nocache else 'page-cached'}")
 
     def get_many(self, layer, expert_ids):
         """Fetch several experts, reading misses from SSD in parallel."""
@@ -56,7 +89,8 @@ class ExpertStore:
         lf = self.layers[layer]
         missing = [e for e in expert_ids if (layer, e) not in self.cache]
         if missing:
-            blobs = list(self.io.map(lf.read_blob, missing))
+            read = lf.read_blob_nocache if self.prefill_nocache else lf.read_blob
+            blobs = list(self.io.map(read, missing))
             for e, blob in zip(missing, blobs):
                 st["misses"] += 1
                 st["bytes"] += lf.stride
