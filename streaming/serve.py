@@ -15,8 +15,15 @@ Run (model loads once at startup, ~1 s after repack; keep the machine awake):
   caffeinate -i python3 streaming/serve.py --cache-gb 8          # 127.0.0.1:8399
 
 Design decisions:
-- One model process, one GPU: generation is strictly serialized on a global
-  lock. Concurrent requests QUEUE on that lock (not strictly FIFO); a request
+- ALL MLX work (model load, seeding, prefill, decode) happens on ONE persistent
+  generation thread started before uvicorn. MLX streams are thread-local: an
+  array whose lazy graph nodes were recorded on thread A cannot be evaluated
+  from thread B once A is gone ("There is no Stream(gpu, N) in current
+  thread" -> uncaught C++ exception -> abort). The resident KV slot holds
+  exactly such lazily-updated arrays between requests, and FastAPI runs sync
+  endpoints on a rotating anyio thread pool, so the worker thread is the only
+  safe home for the GPU. Endpoints enqueue jobs and wait on a per-request
+  queue; the single worker serializes generation naturally (FIFO). A request
   that cannot start within --queue-timeout seconds (default 600) gets a 429.
 - Defaults favor latency: thinking mode OFF (--thinking-mode thinking to
   enable), greedy decoding when temperature is 0/unset, and max_tokens both
@@ -38,7 +45,7 @@ Conversation KV reuse (default on; --no-kv-reuse for the old behavior):
   and prefills fresh. The suffix is fed through the DECODE path one token at a
   time — the port's batched prefill cannot continue from a nonzero cache
   offset (it re-assigns positions from 0 and reseeds window/compressor state).
-- The slot is only touched under the generation lock. usage reports
+- The slot is only ever touched by the generation thread. usage reports
   prompt_tokens_details.cached_tokens; the per-request log line shows
   reused/processed counts.
 
@@ -50,7 +57,7 @@ Limitations (v1):
   stripped, reasoning separated from the answer by chat.py's "---" line); the
   non-streaming response separates it properly into "reasoning_content".
 - If a streaming client disconnects mid-generation, generation still runs to
-  completion before the next request starts (the worker owns the GPU lock).
+  completion before the next request starts (the worker finishes its job).
 - Batch size 1; "model" in the request body is accepted and ignored.
 """
 
@@ -86,18 +93,23 @@ from run_streaming import load_streaming                  # noqa: E402
 MODEL_ID = "deepseek-v4-flash-streaming"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# Populated in main() before uvicorn starts; the model is loaded exactly once.
+# Populated by the generation worker thread at startup; loaded exactly once.
 MODEL = ARGS = STORE = TOK = STOPS = None
 CFG: argparse.Namespace = None
-GEN_LOCK = threading.Lock()  # one GPU -> strictly one generation at a time
 
-# The resident conversation slot (guarded by GEN_LOCK): token ids whose KV the
-# cache already holds, the cache itself, and the cache's max_seq_len capacity.
+# The single persistent generation thread: endpoints enqueue _Job objects here
+# and wait on job.out. Only this worker ever touches MLX (see module docstring).
+JOBS: "queue.Queue[_Job]" = queue.Queue()
+WORKER_READY = threading.Event()
+WORKER_LOAD_ERROR: Optional[str] = None
+
+# The resident conversation slot (touched only by the worker thread): token ids
+# whose KV the cache already holds, the cache, and its max_seq_len capacity.
 SLOT: Dict[str, Any] = {"ids": None, "cache": None, "capacity": 0}
 
 
 def _slot_acquire(ids: List[int], max_new: int):
-    """Return (cache, prefix_len) for this request. Caller holds GEN_LOCK.
+    """Return (cache, prefix_len) for this request. Worker thread only.
 
     Reuse iff the request's ids strictly extend the slot's processed ids and
     the slot cache can hold the finished turn; otherwise discard and rebuild.
@@ -323,27 +335,104 @@ def chat_completions(req: ChatRequest):
     return _blocking_response(ids, sampler, max_new)
 
 
+# ------------------------------------------------------- the generation worker
+
+class _Job:
+    """One queued generation request and its result channel."""
+
+    __slots__ = ("ids", "sampler", "max_new", "stream", "out", "lock",
+                 "started", "cancelled")
+
+    def __init__(self, ids, sampler, max_new, stream: bool):
+        self.ids, self.sampler, self.max_new = ids, sampler, max_new
+        self.stream = stream
+        self.out: queue.Queue = queue.Queue()
+        self.lock = threading.Lock()  # arbitrates start vs queue-timeout cancel
+        self.started = False
+        self.cancelled = False
+
+
+def _worker_main():
+    """The persistent generation thread: loads the model, then serves jobs.
+
+    Every MLX touch lives here — load, seeding, slot caches, generation — so no
+    lazy array ever crosses threads. A per-request failure returns an error to
+    that request and drops the KV slot; it never kills the worker or process.
+    """
+    global MODEL, ARGS, STORE, TOK, STOPS, WORKER_LOAD_ERROR
+    try:
+        if CFG.seed is not None:
+            mx.random.seed(CFG.seed)  # lazy key array -> must be made here
+        t0 = time.time()
+        MODEL, ARGS, STORE = load_streaming(CFG.repacked, CFG.cache_gb, CFG.store)
+        TOK = load_tokenizer(CFG.repacked)
+        STOPS = stop_ids(TOK)
+        print(f"[serve] model loaded in {time.time()-t0:.1f}s | "
+              f"cache {CFG.cache_gb} GB | {CFG.thinking_mode} mode | "
+              f"max_tokens cap {CFG.max_tokens_cap} | "
+              f"kv reuse {'on' if CFG.kv_reuse else 'off'}",
+              file=sys.stderr, flush=True)
+    except Exception as err:
+        WORKER_LOAD_ERROR = f"{type(err).__name__}: {err}"
+        WORKER_READY.set()
+        return
+    WORKER_READY.set()
+
+    while True:
+        job = JOBS.get()
+        with job.lock:
+            if job.cancelled:  # requester gave up (queue timeout) — skip
+                continue
+            job.started = True
+        job.out.put(("start", None))
+        try:
+            cache, prefix_len = _slot_acquire(job.ids, job.max_new)
+            if job.stream:
+                with contextlib.redirect_stdout(_DeltaWriter(job.out)):
+                    text, hit_eos, stats = generate_turn(
+                        MODEL, ARGS, TOK, job.ids, job.sampler, STOPS,
+                        max_new=job.max_new, thinking_mode=CFG.thinking_mode,
+                        echo=True, cache=cache, prefix_len=prefix_len)
+            else:
+                text, hit_eos, stats = generate_turn(
+                    MODEL, ARGS, TOK, job.ids, job.sampler, STOPS,
+                    max_new=job.max_new, thinking_mode=CFG.thinking_mode,
+                    echo=False, cache=cache, prefix_len=prefix_len)
+            _slot_commit(job.ids, stats["out_ids"], cache)
+            job.out.put(("done", (text, hit_eos, stats)))
+        except Exception as err:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            _slot_drop()
+            job.out.put(("error", f"{type(err).__name__}: {err}"))
+
+
+def _submit(ids, sampler, max_new, stream: bool) -> _Job:
+    """Enqueue a job and wait for the worker to start it (429 on timeout)."""
+    job = _Job(ids, sampler, max_new, stream)
+    JOBS.put(job)
+    try:
+        job.out.get(timeout=CFG.queue_timeout)  # always ("start", None)
+    except queue.Empty:
+        with job.lock:
+            if not job.started:
+                job.cancelled = True
+                raise HTTPException(
+                    status_code=429,
+                    detail="generation busy: queued past --queue-timeout")
+        job.out.get()  # started at the same instant we timed out — proceed
+    return job
+
+
 # ---------------------------------------------------------------- non-streaming
 
 def _blocking_response(ids, sampler, max_new):
-    if not GEN_LOCK.acquire(timeout=CFG.queue_timeout):
-        raise HTTPException(status_code=429,
-                            detail="generation busy: queued past --queue-timeout")
-    try:
-        cache, prefix_len = _slot_acquire(ids, max_new)
-        text, hit_eos, stats = generate_turn(
-            MODEL, ARGS, TOK, ids, sampler, STOPS,
-            max_new=max_new, thinking_mode=CFG.thinking_mode, echo=False,
-            cache=cache, prefix_len=prefix_len)
-        _slot_commit(ids, stats["out_ids"], cache)
-    except HTTPException:
-        _slot_drop()
-        raise
-    except Exception as err:
-        _slot_drop()
-        raise HTTPException(status_code=500, detail=f"generation failed: {err}")
-    finally:
-        GEN_LOCK.release()
+    job = _submit(ids, sampler, max_new, stream=False)
+    kind, payload = job.out.get()  # blocks for the whole generation
+    if kind == "error":
+        raise HTTPException(status_code=500,
+                            detail=f"generation failed: {payload}")
+    text, hit_eos, stats = payload
 
     msg = parse_turn(text, hit_eos, CFG.thinking_mode)
     _log_request("chat.completion", stats)
@@ -382,42 +471,13 @@ class _DeltaWriter:
         pass
 
 
-def _gen_worker(q: queue.Queue, ids, sampler, max_new):
-    """Owns the GPU lock for the whole generation; always signals start/busy."""
-    if not GEN_LOCK.acquire(timeout=CFG.queue_timeout):
-        q.put(("busy", None))
-        return
-    try:
-        q.put(("start", None))
-        cache, prefix_len = _slot_acquire(ids, max_new)
-        with contextlib.redirect_stdout(_DeltaWriter(q)):
-            text, hit_eos, stats = generate_turn(
-                MODEL, ARGS, TOK, ids, sampler, STOPS,
-                max_new=max_new, thinking_mode=CFG.thinking_mode, echo=True,
-                cache=cache, prefix_len=prefix_len)
-        _slot_commit(ids, stats["out_ids"], cache)
-        q.put(("done", (text, hit_eos, stats)))
-    except Exception as err:
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        _slot_drop()
-        q.put(("error", f"{type(err).__name__}: {err}"))
-    finally:
-        GEN_LOCK.release()
-
-
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def _stream_response(ids, sampler, max_new):
-    q: queue.Queue = queue.Queue()
-    threading.Thread(target=_gen_worker, args=(q, ids, sampler, max_new),
-                     daemon=True).start()
-    kind, _ = q.get()  # blocks while queued behind an active generation
-    if kind == "busy":
-        raise HTTPException(status_code=429,
-                            detail="generation busy: queued past --queue-timeout")
+    job = _submit(ids, sampler, max_new, stream=True)  # 429s while queued
+    q = job.out
 
     rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -461,7 +521,7 @@ def _stream_response(ids, sampler, max_new):
 # ----------------------------------------------------------------------- main
 
 def main():
-    global MODEL, ARGS, STORE, TOK, STOPS, CFG
+    global CFG
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--repacked", default=os.path.join(
@@ -489,17 +549,15 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     CFG = ap.parse_args()
 
-    if CFG.seed is not None:
-        mx.random.seed(CFG.seed)
-
-    t0 = time.time()
-    MODEL, ARGS, STORE = load_streaming(CFG.repacked, CFG.cache_gb, CFG.store)
-    TOK = load_tokenizer(CFG.repacked)
-    STOPS = stop_ids(TOK)
-    print(f"[serve] model loaded in {time.time()-t0:.1f}s | cache {CFG.cache_gb} GB "
-          f"| {CFG.thinking_mode} mode | max_tokens cap {CFG.max_tokens_cap} "
-          f"| kv reuse {'on' if CFG.kv_reuse else 'off'}",
-          file=sys.stderr, flush=True)
+    # All MLX work — including model load and seeding — happens on the one
+    # persistent generation thread (see _worker_main).
+    threading.Thread(target=_worker_main, name="generation-worker",
+                     daemon=True).start()
+    WORKER_READY.wait()
+    if WORKER_LOAD_ERROR is not None:
+        print(f"[serve] model load failed: {WORKER_LOAD_ERROR}",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
 
     import uvicorn
     uvicorn.run(app, host=CFG.host, port=CFG.port, log_level="info")
