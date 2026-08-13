@@ -78,17 +78,36 @@ def make_sampler(temp: float, top_p: float):
 
 def generate_turn(model, args, tok, prompt_ids, sampler, stops,
                   max_new: int = 512, thinking_mode: str = "chat",
-                  echo: bool = True):
+                  echo: bool = True, cache=None, prefix_len: int = 0):
     """Generate one assistant turn. Returns (text, hit_eos, stats dict).
 
     Streams decoded text to stdout as it arrives (reasoning dimmed in thinking
     mode). Deltas come from re-decoding the full token list and diffing, since a
     single BPE token can be a partial UTF-8 sequence.
+
+    ``cache``/``prefix_len`` support conversation KV reuse (serve.py): pass a
+    cache whose first ``prefix_len`` positions already hold KV for
+    ``prompt_ids[:prefix_len]`` and only the suffix is processed. The suffix
+    goes through the DECODE path one token at a time, not batched prefill:
+    the prefill branch of attention assigns absolute positions 0..s-1 and
+    reseeds the window ring + compressor/indexer state from scratch
+    (``Attention._seed_cache``), so it cannot extend a nonzero offset.
+    Decode-append is correct by construction — it is exactly what generation
+    already does — and a typical user turn is 10-100 tokens, far cheaper than
+    re-prefilling the whole conversation.
     """
-    cache = make_cache(args, bsz=1, max_seq_len=len(prompt_ids) + max_new + 8)
+    assert 0 <= prefix_len < len(prompt_ids)
+    if cache is None:
+        assert prefix_len == 0
+        cache = make_cache(args, bsz=1, max_seq_len=len(prompt_ids) + max_new + 8)
 
     t0 = time.time()
-    logits = model(mx.array([prompt_ids]), last_logit_only=True, cache=cache)
+    if prefix_len:
+        for t in prompt_ids[prefix_len:]:
+            logits = model(mx.array([[t]]), last_logit_only=True, cache=cache)
+            mx.eval(logits)  # bound the lazy graph per token, as decode does
+    else:
+        logits = model(mx.array([prompt_ids]), last_logit_only=True, cache=cache)
     nxt = sampler(logits[0, -1])
     prefill_s = time.time() - t0
 
@@ -121,7 +140,10 @@ def generate_turn(model, args, tok, prompt_ids, sampler, stops,
 
     stats = {"prompt_tokens": len(prompt_ids), "new_tokens": len(out),
              "prefill_s": round(prefill_s, 1),
-             "decode_tok_s": round(len(out) / decode_s, 2) if decode_s > 0 else 0.0}
+             "decode_tok_s": round(len(out) / decode_s, 2) if decode_s > 0 else 0.0,
+             "reused_tokens": prefix_len,
+             "processed_tokens": len(prompt_ids) - prefix_len,
+             "out_ids": out}
     return tok.decode(out), hit_eos, stats
 
 

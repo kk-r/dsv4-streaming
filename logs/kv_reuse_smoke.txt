@@ -1,0 +1,29 @@
+=== KV-reuse smoke 2026-08-13 09:47:41 ===
+config: --cache-gb 8, chat mode, greedy, max_tokens 48, 3-turn scripted conversation
+run order: reuse server first (cold page cache), then control server (page cache warmed)
+
+turn | prompt tok | reuse: cached/latency | control: cached/latency | end-to-end speedup | identical
+  1  |     15     |    0 /   46.4s   |     0 /   35.0s    |  0.75x  |  True
+  2  |     61     |   46 /   59.4s   |     0 /  131.3s    |  2.21x  |  True
+  3  |    122     |  109 /   51.3s   |     0 /  134.6s    |  2.62x  |  True
+
+server-side prefill (the isolated reuse effect):
+  turn 2: reuse 15.0s (13-15 suffix tok via decode path) vs control 67.9s (61-tok full re-prefill) = 4.5x
+  turn 3: reuse 16.3s vs control 82.0s (122-tok full re-prefill) = 5.0x
+decode after prefill: reuse 1.08/1.11 tok/s vs control 0.76/0.74 tok/s (turns 2/3)
+turn 1 (no reuse possible in either config): reuse-server 46.4s vs control-server 35.0s;
+  reuse server ran first on a cold page cache (prefill 11.6s vs 5.7s) - known ~2x variance, not a reuse cost
+peak memory: reuse 18.3 GB vs control 21.5 GB
+
+IDENTICAL-OUTPUT CHECK: PASS (all 3 replies byte-identical, greedy, chat mode)
+
+--- turn 1 reply (stop) ---
+The sky appears blue because air molecules scatter shorter (blue) wavelengths of sunlight much more strongly than longer (red) wavelengths, a phenomenon called Rayleigh scattering.
+
+--- turn 2 reply (length) ---
+Yes, the same Rayleigh scattering explains red sunsets because, with the sun low on the horizon, its light travels through far more atmosphere, scattering away the blue and green wavelengths and leaving the longer red and orange wavelengths to reach your eyes.
+
+--- turn 3 reply (stop) ---
+Clouds appear white because their water droplets and ice crystals are much larger than air molecules, so they scatter all wavelengths of visible light equally and in all directions, which combines to create white light.
+
+======================================================================
