@@ -1,0 +1,13 @@
+# Prefill LRU-protection A/B (DSV4_PREFILL_NO_EVICT) — 2026-08-15
+# Hypothesis (docs/ds4-recon.md steal-list #2): decode-after-long-prefill collapse is caused by
+# prefill EVICTING the MLX-side LRU. Policy under test: get_many (prefill) may FILL the LRU but
+# never EVICT for it; misses are decoded and returned for the pass, inserted only into free
+# capacity. get (decode) unchanged. Flag DSV4_PREFILL_NO_EVICT=1, default OFF.
+# Prompt: "Summarize the following document:\n\n" + README.md lines 1-6 + first 180 chars of line 7
+#   = logs/prefill_lru_prompt.txt, 312 chat-encoded tokens (original 08-12 A/B was 316; README drifted).
+# Command: caffeinate -i python3 streaming/chat.py --cache-gb 8 --prompt "$(cat logs/prefill_lru_prompt.txt)" --max-new 100
+# Fresh cold process per run; pkill of model processes confirmed before each; 25-min bound per run.
+# New instrumentation in store summary: decode_hits/decode_misses/decode_read_gb (get() path only,
+# i.e. pure decode phase) and noevict_skipped (misses returned to prefill but not cached).
+# Unit test of the policy passed (synthetic layer file): returns all requested entries, never
+# exceeds capacity, never changes the residency set on a full cache; get() still evicts normally.

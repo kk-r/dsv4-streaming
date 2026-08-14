@@ -80,8 +80,25 @@ class ExpertStore:
             # re-testing on a quiet machine.
             prefill_nocache = os.environ.get("DSV4_PREFILL_NOCACHE", "0") == "1"
         self.prefill_nocache = prefill_nocache
+        # ds4-style prefill insert policy (docs/ds4-recon.md §2.4): prefill may
+        # FILL the LRU but never EVICT for it. Under DSV4_PREFILL_NO_EVICT=1 a
+        # get_many miss is decoded and returned for the pass, but inserted into
+        # the LRU only while free capacity remains — an existing entry is never
+        # evicted on behalf of a prefill batch. get (the decode path) is
+        # unchanged and still evicts normally. Default OFF for a clean A/B.
+        # Default ON: the A/B (logs/prefill_lru.txt) showed decode unchanged
+        # but prefill 2x FASTER — skipping insert/evict churn for blobs the
+        # LRU cannot hold anyway. Disable with DSV4_PREFILL_NO_EVICT=0.
+        self.prefill_no_evict = os.environ.get("DSV4_PREFILL_NO_EVICT", "1") != "0"
+        self.noevict_skipped = 0  # misses returned for the pass but not cached
+        # Per-path counters: get() is only called by single-token decode,
+        # get_many() only by batched prefill, so this splits the aggregate
+        # stats by phase without touching the callers.
+        self.decode_stats = {"hits": 0, "misses": 0, "bytes": 0}
         print(f"[store] prefill (get_many) reads: "
-              f"{'F_NOCACHE' if self.prefill_nocache else 'page-cached'}")
+              f"{'F_NOCACHE' if self.prefill_nocache else 'page-cached'}; "
+              f"insert policy: "
+              f"{'fill-no-evict' if self.prefill_no_evict else 'lru-evict'}")
 
     def get_many(self, layer, expert_ids):
         """Fetch several experts, reading misses from SSD in parallel."""
@@ -97,25 +114,43 @@ class ExpertStore:
             if key in self.cache:
                 self.cache.move_to_end(key)
         missing = [e for e in expert_ids if (layer, e) not in self.cache]
+        fresh = {}  # this pass's decoded misses; returned regardless of caching
         if missing:
             read = lf.read_blob_nocache if self.prefill_nocache else lf.read_blob
             blobs = list(self.io.map(read, missing))
             for e, blob in zip(missing, blobs):
                 st["misses"] += 1
                 st["bytes"] += lf.stride
-                self.cache[(layer, e)] = self._decode(layer, blob)
-                self.used += lf.stride
-            while self.used > self.capacity and len(self.cache) > len(expert_ids):
-                old_key, _ = self.cache.popitem(last=False)
-                self.used -= self.layers[old_key[0]].stride
+                fresh[e] = self._decode(layer, blob)
+            if self.prefill_no_evict:
+                # Fill-but-never-evict: insert only while free capacity remains.
+                # Entries not inserted still live in `fresh`/`out` for the
+                # duration of the pass (the gather stack needs them), then drop.
+                for e, entry in fresh.items():
+                    if self.used + lf.stride <= self.capacity:
+                        self.cache[(layer, e)] = entry
+                        self.used += lf.stride
+                    else:
+                        self.noevict_skipped += 1
+            else:
+                for e, entry in fresh.items():
+                    self.cache[(layer, e)] = entry
+                    self.used += lf.stride
+                while self.used > self.capacity and len(self.cache) > len(expert_ids):
+                    old_key, _ = self.cache.popitem(last=False)
+                    self.used -= self.layers[old_key[0]].stride
         out = {}
         for e in expert_ids:
             key = (layer, e)
-            if e not in out and key in self.cache:
-                if e not in missing:
+            if e in out:
+                continue
+            if key in self.cache:
+                if e not in fresh:
                     st["hits"] += 1
                 self.cache.move_to_end(key)
                 out[e] = self.cache[key]
+            elif e in fresh:
+                out[e] = fresh[e]
         return out
 
     def _decode(self, layer, blob):
@@ -137,11 +172,14 @@ class ExpertStore:
         st = self.stats[layer]
         if key in self.cache:
             st["hits"] += 1
+            self.decode_stats["hits"] += 1
             self.cache.move_to_end(key)
             return self.cache[key]
         st["misses"] += 1
+        self.decode_stats["misses"] += 1
         lf = self.layers[layer]
         st["bytes"] += lf.stride
+        self.decode_stats["bytes"] += lf.stride
         entry = self._decode(layer, lf.read_blob(expert_id))
         self.cache[key] = entry
         self.used += lf.stride
@@ -156,7 +194,11 @@ class ExpertStore:
         gb = sum(s["bytes"] for s in self.stats.values()) / 1e9
         rate = h / (h + m) if h + m else 0.0
         return {"hits": h, "misses": m, "hit_rate": round(rate, 4),
-                "read_gb": round(gb, 2), "cached_gb": round(self.used / 1e9, 2)}
+                "read_gb": round(gb, 2), "cached_gb": round(self.used / 1e9, 2),
+                "decode_hits": self.decode_stats["hits"],
+                "decode_misses": self.decode_stats["misses"],
+                "decode_read_gb": round(self.decode_stats["bytes"] / 1e9, 2),
+                "noevict_skipped": self.noevict_skipped}
 
 
 class StreamingExperts:

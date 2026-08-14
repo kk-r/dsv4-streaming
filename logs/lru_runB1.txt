@@ -1,0 +1,13 @@
+[store] prefill (get_many) reads: page-cached; insert policy: fill-no-evict
+[load] resident weights in 0.8s (9.4 GB active)
+Here is a summary of the document:
+
+**Project Overview**
+- **Goal:** Run DeepSeek-V4-Flash (284B sparse MoE model) on a 64 GB M5 Pro MacBook via SSD streaming.
+- **Challenge:** The model is too large for available memory—quantized checkpoints are 165 GB, and the smallest existing quant (83 GB GGUF, 92.7 GB MLX) still exceeds 64 GB.
+
+**Solution**
+- Keep only the
+[chat] hit --max-new 100 before the turn finished
+[chat] prefill 38.7s (312 tok), decode 0.62 tok/s (100 tok) | store {'hits': 11987, 'misses': 20986, 'hit_rate': 0.3635, 'read_gb': 297.07, 'cached_gb': 8.0, 'decode_hits': 11987, 'decode_misses': 13813, 'decode_read_gb': 195.53, 'noevict_skipped': 6608}
+[mem] peak 24.3 GB
