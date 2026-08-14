@@ -1,0 +1,233 @@
+# Speculative decoding via prompt-lookup drafting — engineering + measurement log
+# Started 2026-08-15. Hypothesis: decode cost is dominated by per-forward-pass
+# overhead (~128 ms model compute + ~300 ms of 43 per-layer Python sync
+# round-trips), not per-token weight reads. Verifying k drafted tokens in ONE
+# batched forward should amortize the per-pass cost across accepted tokens.
+#
+# Design decisions (from code reading, before any run):
+# - Attention.__call__ has NO batched decode-append: s>1 goes to the prefill
+#   branch, which assigns positions 0..s-1 and reseeds the cache via
+#   _seed_cache. So spec_generate.py patches Attention.__call__: when
+#   cache.offset > 0 and s > 1, it unrolls into s lazy attn.step() calls in
+#   one graph. This is numerically the EXACT op sequence sequential decode
+#   performs per position (same window ring writes, same compressor steps,
+#   same indexer top-k), so attention-side byte-identity holds by
+#   construction. The MoE path stays batched over the s tokens
+#   (StreamingExperts dispatches s>1 through gather_qmm/get_many), which is
+#   where the 43 per-layer np.asarray syncs live -> syncs per pass collapse
+#   from 43*s to 43. That is the entire point.
+# - Window ring hazard checked: window_size=128. Batched writes of future
+#   positions would clobber slots that earlier in-batch queries still need
+#   once the ring wraps (slot (p+j)%128 == slot of p+j-128, which is inside
+#   query p's window). The unrolled-lazy-steps approach dodges this entirely:
+#   MLX arrays are functional, each step reads the array version as of its
+#   position, so in-graph sequential ring writes are correct at any offset.
+# - KV rewind on partial acceptance: per-position reference snapshots taken
+#   after each in-graph step (offset, kv, idx_kv, comp.kv_state/score_state,
+#   idx_comp state). Saving attr references IS the snapshot (setitem rebinds
+#   — same trick as optimistic.py _snapshot/_restore). Restore to snaps[a]
+#   = state after the last accepted input token. This also covers the
+#   compressor partial-span state and its destructive shift(), which
+#   position-overwrite semantics alone would NOT cover (spans closed by
+#   rejected drafts shift() the rolling state).
+# - Residual byte-identity risk (empirical, gated below): the verify pass
+#   computes gate scores / expert FFN batched (gather_qmm over s tokens) vs
+#   decode's per-token quantized_matmul loop; GEMM tiling differences could
+#   in principle flip a near-tied argmax. The correctness gate tests this.
+#
+# Method: prompt-lookup (n-gram) drafting, greedy verification. Draft = copy
+# of the continuation of the most recent longest n-gram match (n from n_max
+# down to n_min=2) of the current suffix over prompt+generated ids. No draft
+# model. Output provably identical to plain greedy modulo the fp caveat above.
+#
+# All timed runs: caffeinate -i, one model process at a time (pkill + verify
+# dead first), separate cold process per configuration, --cache-gb 8.
+#
+
+GATE ATTEMPT 1 (2026-08-15): FAIL.
+  plain (run_streaming, 48 tok): ...Germany is Berlin. The capital of United Kingdom is London. The capital of Canada is Ottawa. The capital
+  spec k=8 (48 tok):            ...Germany is Berlin. The capital of Belgium is Brussels. The capital of Austria is Vienna. The capital of Netherlands
+  Divergence at a country-name position (~token 30). Acceptance hist {0:1, 2:6} — passes accept the ". The capital of" scaffolding, reject at the (novel) country name, as expected for prompt-lookup on this prompt. Divergent token is a BONUS token (trusted from the batched pass without sequential verification) at a plausibly near-tied position.
+  Suspects: (1) unrolled-attention state bug, (2) rewind bug, (3) fp difference batched-vs-single MoE (gate GEMM + gather_qmm vs quantized_matmul loop) flipping a near-tied argmax.
+  Next: teacher-forced diagnostic — same 48 reference tokens fed (a) sequentially, (b) in verify-shaped 9-token batches, (c) batch + rewind-to-3 + sequential — comparing argmax and top-2 margins per position.
+
+DIAGNOSTICS (scratchpad diag_spec.py / diag2_exact.py, teacher-forced on the
+sequential reference tokens, capitals prompt):
+1. Batched verify (model.__call__ over s=9 with unrolled per-position
+   attention): 0/48 argmax mismatches BUT logit top-2 margin drift up to
+   ~1.0 from pos 13 on (e.g. 10.24 vs 9.40; 0.52 vs 0.14). Cause: MoE gate
+   GEMM, gather_qmm (vs decode's per-expert quantized_matmul), and hc
+   projections run different-shaped kernels at s>1 -> different fp
+   accumulation. Near-tied positions (country names, margins ~0.15-0.5)
+   can flip -> the gate-1 divergence. CONCLUSION: no multi-token-batch
+   verifier that changes kernel shapes can be byte-identical on this stack.
+2. Exact verify (_verify_exact: every op per token at decode shapes;
+   batched ONLY per-layer index sync + get_many union prefetch):
+   BITWISE identical teacher-forced, 0/24 positions differ. ~3.2 s per
+   9-token chunk in-process.
+3. Rewind was NOT bitwise (8/10 positions after rewind, max|d| up to 2.9),
+   diverging exactly at the first ratio-4 span closure after the rewind
+   point. ROOT CAUSE — PROJECT LORE OVERTURNED: mx.array.__setitem__
+   mutates the SAME Python object in place (verified with a 6-line repro:
+   b = a; a[0] = 1 -> b shows the update, a is b). "Saving attr references
+   IS the snapshot because MLX setitem rebinds" (optimistic.py) is FALSE
+   for setitem-updated buffers (LayerCache.kv/idx_kv, CompressorCache
+   kv_state/score_state via write()/shift()). optimistic.py's restore never
+   noticed because its repair-redo reruns the SAME token at the SAME
+   position -> rewrites byte-identical values -> rollback was a no-op.
+   FIX: snapshot = x[:] (new object wrapping the current value node; the
+   later scatter replaces only the original object's node). Position-
+   overwrite semantics alone would NOT have sufficed: the compressor
+   rolling state is destructive (shift(), slot reuse across spans), and
+   window-ring overwrite-safety breaks once the ring wraps (stale slot
+   (p+j)%128 sits inside earlier queries' windows).
+
+GATE ATTEMPT 2 (exact mode, snapshot fix): PASS.
+  run_streaming.py greedy, capitals, 48 new tok, 8 GB cache  vs
+  spec_generate.py --mode exact --k 8, same prompt/settings:
+  output blocks BYTE-IDENTICAL ("...Germany is Berlin. The capital of
+  United Kingdom is London. The capital of Canada is Ottawa...").
+  Gate run stats (cold process): 7 verify passes, 30 plain steps,
+  drafted 50 accepted 12 (0.24), hist {0:1, 2:6} — capitals accepts the
+  ". The capital of" scaffolding and rejects at each novel country name,
+  so the best case for LOOKUP acceptance is not the best case for
+  ACCEPTANCE DEPTH. Decode 1.06 tok/s vs plain-in-run_streaming 1.24
+  incl-prefill (not a controlled pair; measurements below are).
+
+MEASUREMENT MATRIX (all: caffeinate -i, fresh cold process per config,
+pkill+verify-dead between runs, --cache-gb 8, 96 new tokens, greedy):
+  prompts: A=capitals "The capital of France is"
+           B=freeform "Explain why the sky is blue in detail"
+           C=structured "Below is a numbered list of the ten largest
+             countries in the world by land area, each with its capital
+             city:\n1."
+  configs per prompt: plain (k=0), exact k=4, exact k=8;
+  plus batched k=4/k=8 on prompt A only (documented non-byte-identical).
+
+================================ RESULTS =================================
+All: M5 Pro 64 GB, caffeinate -i, one fresh cold process per row, 8 GB
+cache, greedy, 96 new tokens, decode-phase tok/s (prefill excluded).
+Raw per-run JSON (incl. out_ids for byte checks): logs/spec_runs/*.json.
+Swap at session start: 1.05 GB used (idle baseline; no ambient pressure).
+
+Prompt A — capitals "The capital of France is" (5 tok):
+  config        tok/s   decode_s  forwards(verify/plain)  drafted acc  rate  tok/fwd  GB read  byte-id
+  plain         2.134    44.5     96 (0/95)                 -      -    -     1.00     206.2    (ref)
+  exact  k=4    1.121    84.8     73 (14/58)                56    23   0.41   1.32     276.9    YES
+  exact  k=8    0.842   112.8     73 (14/58)               103    23   0.22   1.32     344.5    YES
+  batched k=4   1.020    93.1     73 (13/59)                52    23   0.44   1.32     266.6    NO (diff @68)
+  batched k=8   0.598   158.9     73 (13/59)                97    23   0.24   1.32     332.1    NO (diff @68)
+  Acceptance hist (exact k4): {0:2, 1:1, 2:11} — accepts ". The capital of"
+  scaffolding, rejects at every novel country name. Mean accepted/pass 1.64.
+
+Prompt B — freeform "Explain why the sky is blue in detail" (8 tok):
+  plain         2.583    36.8     96 (0/95)                 -      -    -     1.00     185.7    (ref)
+  exact  k=4    1.391    68.3     96 (4/91)                 16     0   0.00   1.00     224.6    YES
+  exact  k=8    1.004    94.7     96 (4/91)                 32     0   0.00   1.00     259.8    YES
+  Prompt-lookup found only 4 draftable suffixes in 96 tokens and none
+  verified. Pure loss: -46% (k4), -61% (k8).
+
+Prompt C — numbered list (ten largest countries + capitals, 25 tok):
+  plain         0.793   119.8     96 (0/95)                 -      -    -     1.00     238.4    (ref)
+  exact  k=4    0.759   125.1     96 (1/94)                  4     0   0.00   1.00     244.5    YES
+  Surprise: a numbered list of UNIQUE items has ~zero n-gram repetition
+  (every line differs in number, country, capital) — for prompt-lookup it
+  is freeform, not a middle case. Replaced by C2.
+
+Prompt C2 — JSON schema repetition (keys "country"/"capital"/"population"
+repeated per object; 49 tok) — the real middle case:
+  plain         0.722   131.5     96 (0/95)                 -      -    -     1.00     273.7    (ref)
+  exact  k=4    0.395   240.3     65 (25/39)               100    31   0.31   1.48     449.2    YES
+  exact  k=8    0.348   273.2     62 (22/39)               170    34   0.20   1.56     550.2    YES
+  Best tokens/forward of the whole study (1.56, hist incl. three 6-accepts)
+  — and the worst relative throughput (0.48x). More amortization, more loss.
+
+Byte-identity: exact mode is token-identical to plain greedy in 7/7
+cross-process comparisons (A k4/k8, B k4/k8, C k4, C2 k4/k8), plus the
+48-token gate vs run_streaming.py. Batched mode diverges deterministically
+at token 68 on prompt A for both k — the measured fp margin drift flipping
+a near-tied argmax, exactly as the teacher-forced diagnostic predicted.
+Peak memory never exceeded 19.1 GB (constraint was ~25 GB).
+
+============================== ANALYSIS ==================================
+VERDICT: the hypothesis FAILS on this stack in the regime that matters.
+Speculative decoding reduced forwards per token by up to 35% (1.32-1.56
+tokens/forward) with provably identical output — and LOWERED throughput in
+every single configuration (0.44x-0.96x). The per-forward-pass cost is not
+approximately fixed; it scales with the tokens in the pass.
+
+Where the 43-sync amortization went:
+1. A verify token costs about as much as a decode token, because both are
+   dominated by expert traffic, and expert traffic scales with DRAFTED (not
+   accepted) tokens. Each in-pass token routes to ~6 mostly-fresh experts
+   per layer; the union get_many is mostly misses at an 8 GB budget. GB
+   read tracks wall time across all 14 runs: A plain 206 GB -> k8 344 GB;
+   C2 plain 274 GB -> k8 550 GB (for the SAME 96 emitted tokens).
+2. In-pass marginal cost per token, measured (extra decode time / passes /
+   s, attributing surrounding plain steps at the plain-run rate):
+   A exact k4 ~0.82 s, A exact k8 ~0.68 s, C2 exact k4 ~1.49 s — equal to
+   or HIGHER than the plain per-token cost (A 0.47 s, C2 1.38 s).
+   Amortization is zero-to-negative before acceptance even enters, so no
+   acceptance rate can rescue it: speedup ~= (a+1)/(k+1) <= 1.
+3. Second-order pollution: rejected drafts' experts churn the LRU (~350+
+   blob inserts/pass), evicting the warm set the interleaved plain steps
+   rely on — the spec runs' plain steps are themselves slower.
+4. Batched-mode kernels do not save it (A: batched k4 1.02 < exact k4
+   1.12; batched k8 0.60 < exact k8 0.84): the gather_qmm stacking copies
+   (~14.16 MB x union x 3 projections per layer per pass) plus the same
+   IO dominate — and it loses byte-identity.
+5. The store's per-blob Python cost (pread + np.frombuffer + 9 mx.array
+   creations + LRU bookkeeping, ~1-3 ms/blob) multiplies with union size.
+
+Why the hypothesis looked right: the "~128 ms compute + ~284 ms syncs"
+accounting was measured in the 100%-hit WARM regime (2.43 tok/s ceiling),
+where per-pass overhead really is the whole cost. In that regime spec
+decode WOULD win (estimate: s=9 exact-mode pass ~ 9x128ms + 300ms = 1.45 s
+vs 9 x 410 ms sequential = 2.7x at full acceptance). But the warm regime
+exists only for degenerate prompts; realistic decode at 8 GB streams
+2-3 GB/token and is IO-bound, and spec decode multiplies exactly the
+IO term. Same shape as the project's cache-sweep lesson: the fixed-cost
+model held only in the regime where it was measured.
+
+WHAT A REAL DRAFT HEAD (DSpark MTP) WOULD NEED FOR 2x: on the current
+store, no acceptance rate suffices — perfect acceptance only reaches
+~(plain per-token)/(in-pass per-token) ~= 0.7-1.0x. 2x requires first
+making in-pass tokens genuinely marginal, i.e. store/runtime work, in
+order of leverage:
+  a. batch the union's blob decode + insert (one np.frombuffer over the
+     miss batch, vectorized mx.array creation) and overlap get_many preads
+     with the previous layer's compute (drafts are known at pass start;
+     hash layers 0-2 are prefetchable from token ids alone);
+  b. batch the resident path (accepting fp-tolerant verification or a
+     compiled runtime that makes batched==single bitwise);
+  c. the compiled runtime that removes the 43 syncs AND the per-blob
+     Python cost.
+  With (a)+(b) landed and the warm-regime numbers as the floor (pass ~=
+  0.43 s + s x ~0.05 s IO-effective), 2x over the 0.47 s/tok capitals
+  baseline at k=8 needs (a+1) >= 2*(0.43+9*0.05)/0.47 ~= 3.7, i.e.
+  ~34% token-level acceptance — well within MTP-head territory. On
+  today's Python store, the answer is simply: not reachable.
+
+SIDE FINDINGS (stand on their own):
+* PROJECT LORE CORRECTED: mx.array.__setitem__ mutates the same Python
+  object; reference-saving is NOT a snapshot (optimistic.py's trick).
+  optimistic.py's rollback only ever worked because its redo rewrites
+  identical values. Correct snapshot: x[:] (new node-wrapping object).
+  Any future MLX rollback/rewind code must copy-by-node, not by-ref.
+* A bitwise-exact multi-token decode-append verify EXISTS for this model
+  (spec_generate._verify_exact): per-token ops at decode shapes, batched
+  only in the per-layer index sync and get_many prefetch. Teacher-forced
+  bitwise 0/24, post-rewind bitwise 0/10, 8/8 byte-identical end-to-end
+  runs. Reusable for any future MTP/self-spec work.
+* Any verifier that changes kernel shapes (batched MoE/hc) is NOT
+  byte-identical on this stack: logit margin drift up to ~1.0, determin-
+  istic argmax flips at near-tied positions (margins 0.14-0.52 observed).
+  Greedy spec-decode "provable identity" assumes bitwise-equal forwards —
+  false across MLX GEMM shapes.
+* Prompt-lookup acceptance on real prompts: capitals 0.22-0.41 (structure
+  accepted, novel content rejected), JSON schema 0.20-0.31, freeform 0.0,
+  numbered-list-of-unique-items ~0 (looks structured, draws zero n-gram
+  repeats). Draft-quality, not draft-length, is the binding constraint:
+  raising k 4->8 never raised accepted tokens (23->23, 31->34) but always
+  raised bytes read ~25%.
+==========================================================================

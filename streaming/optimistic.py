@@ -15,9 +15,12 @@ compute. Here the whole token runs lazily:
   token — now correct. Retries are bounded; each repair strictly grows the
   cached set, and routing prefixes stabilize layer by layer.
 
-Rollback is free: MLX arrays are functional, so ``cache.kv[..] = v`` rebinds
-the attribute to a new array while a saved reference still names the old one.
-Snapshot = collect references; restore = assign them back.
+Rollback note — CORRECTED 2026-08-15 (see spec_generate.py): the original
+claim here was that setitem rebinds and saved references are free snapshots.
+That is FALSE: ``mx.array.__setitem__`` mutates the same Python object (6-line
+repro in logs/spec_decode.txt). This file's redo path only worked because the
+redo rewrites identical values over the mutated state. A real snapshot needs
+an explicit copy (``x[:]``), as spec_generate.py's exact-mode rewind does.
 
 Correctness: an accepted token only ever used pool slots whose expert ids were
 verified after evaluation; wrong-slot outputs occur only in passes that get
