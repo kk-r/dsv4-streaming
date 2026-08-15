@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--cache-gb", type=float, default=8.0)
     ap.add_argument("--corpus", default=os.path.join(ROOT, "logs", "ppl_corpus.npy"))
     ap.add_argument("--windows", type=int, default=8)
+    ap.add_argument("--start", type=int, default=0, help="skip the first N windows (resume)")
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", "ppl_streaming.txt"))
     a = ap.parse_args()
@@ -60,7 +61,7 @@ def main():
 
     win_nll, win_tok = [], []
     t0 = time.time()
-    for w in range(n_win):
+    for w in range(a.start, n_win):
         tw = time.time()
         ids = ids_all[w * a.seq:(w + 1) * a.seq].tolist()
         lg = model(mx.array([ids]))[0].astype(mx.float32)
