@@ -1,0 +1,189 @@
+Pre-gated expert prefetch (Mixtral-offloading / Pre-gated MoE trick) — 2026-08-15
+==================================================================================
+
+GOAL: predict layer L+1's routed experts early by applying L+1's resident gate
+to the hidden state at layer L's MoE input (xf), issue ASYNC pread+np-decode for
+the predicted-missing blobs so they arrive while layer L's experts + L+1's
+attention compute. Hash layers 0-2 are EXACT-predictable from the token id at
+token start (tid2eid lookup); scored layers 3+ approximate via pre-gating.
+
+GPU state at start: topk experiment chain still running (ppl_streaming --windows 4,
+last stage). Per GPU rule: building + unit-testing OFFLINE first, will poll for
+"TOPK EXPERIMENT DONE" in logs/topk_experiment.txt before any model run.
+
+DESIGN (agreed constraints):
+- Workers (ThreadPoolExecutor) do os.pread + numpy frombuffer views ONLY.
+  No mx arrays off the main thread (thread-bound MLX streams crash class).
+  Buffer dict {(layer, expert): np entry}; main thread wraps into mx.array at
+  the point of use (store.get on a miss) and inserts into the LRU normally —
+  so LRU insert order/keys are IDENTICAL to HEAD (timing-only change).
+- One sync per layer preserved: decode branch does mx.eval(indices, pred_indices)
+  (was: np.asarray(indices)) — the L+1 gate matmul rides the existing sync.
+- Hash prefetch: Model.__call__ gets an inert getattr hook `token_hook`, fired
+  only for single-token steps; coordinator looks up np copies of tid2eid for
+  layers 0..2 and issues prefetch before the forward even starts.
+- Mispredicted blobs are purged after the target layer's accesses (never enter
+  the LRU) -> byte-identical LRU behavior, wasted reads counted.
+- Flag: DSV4_PREFETCH=1 enables (default OFF = control is current behavior).
+  DSV4_PREFETCH_WORKERS (default 6).
+- Instrumentation: per-layer pred_hit/pred_total (prediction hit rate),
+  prefetch served_ready / served_wait (miss served from buffer vs waited on
+  in-flight read), wasted, issued, prefetch bytes; printed from run_streaming
+  and included in store.summary().
+
+VALIDATION PLAN (after GPU frees, all caffeinate -i, cold process each, <=20 min):
+1. Byte-identity: run_streaming greedy 48 tok "The capital of France is",
+   DSV4_PREFETCH=0 vs 1 — output text + hits/misses must match exactly.
+2. Speed A/B short: run_streaming "Explain why the sky is blue in detail",
+   96 tok, --cache-gb 8, 2 replicates each arm.
+3. Long-prompt: chat.py --cache-gb 8 --prompt "$(cat logs/prefill_lru_prompt.txt)"
+   --max-new 100, control + treatment (control re-measured today; same-day
+   baseline was ~0.62 tok/s decode).
+4. Per-layer-band prediction hit rates (hash 0-2 expected ~100%).
+
+--- build log follows ---
+
+BUILD DONE (offline, GPU untouched while topk chain ran):
+- expert_store.py: _decode_np/_wrap_np split (worker-safe numpy decode vs
+  main-thread mx wrap), ExpertPrefetcher (pool + buf/futures, take waits on
+  in-flight rather than re-reading; buf XOR futures invariant),
+  PrefetchCoordinator (hash tid2eid np snapshot + token_start hook, pre-gate
+  predict/observe/layer_done, per-layer pred_stats, report()).
+  ExpertStore.get consults prefetcher on miss (counters unchanged otherwise);
+  summary() gains pf_* fields when enabled. StreamingExperts decode branch:
+  mx.eval(indices, pred) single sync, predict(L+1) before the expert loop,
+  layer_done purge after.
+- model.py: inert getattr token_hook at top of Model.__call__ (single-token
+  steps only).
+- run_streaming.py: DSV4_PREFETCH=1 wiring (lru store only), next_gate =
+  layers[L+1].ffn.gate for scored L+1; hash gates registered after weight
+  load; [prefetch] report printed in main. chat.py prints report too.
+- Fixed during test: _fetch left completed keys in futures (purge would
+  double-count, wait_idle never drained) -> del on buf insert.
+
+OFFLINE TESTS: streaming/test_prefetch.py 6/6 OK (bit-identical decode, LRU
+residency parity vs control store, dedupe/purge accounting, perfect-prediction
+and misprediction paths bitwise-equal outputs, token_start hash prefetch).
+test_roundtrip.py still OK.
+
+GPU FREE (topk chain completed: aggregate ppl 3.7273 over 4 windows).
+Launching measurement chain: ident off/on (48 tok greedy), short A/B
+off1/on1/off2/on2 (96 tok freeform), long off1/on1/off2/on2 (chat, 100 tok).
+All caffeinate -i, cold process each, interleaved arms.
+[14:34:11] START ident_off
+[14:34:33] DONE  ident_off
+[14:34:33] START ident_on
+[14:34:52] DONE  ident_on
+[14:34:52] START short_off1
+
+RESULT 1 — BYTE-IDENTITY (greedy 48 tok, "The capital of France is"):
+PASS. Output text diff empty; store counters identical off vs on
+(hits 5799 / misses 7243 / hit_rate 0.4446 / read 102.53 GB) — prefetch
+changed timing only, as designed. Wall: off 17.4s (2.77 tok/s incl prefill),
+on 15.4s (3.11 tok/s). Note both runs rode a topk-chain-warmed page cache.
+Prediction (on-run): hash 0-2 846/846 = 100.0%; scored 3-15 64.5%,
+16-29 72.6%, 30-42 71.5%. pf_served 4212 of 6327 decode misses (66.6%)
+came out of the prefetch buffer (4034 ready + 178 waited); 2612 wasted
+reads (38% of 6824 issued, 96.6 GB prefetch traffic vs 89.6 GB demand).
+Ambient state during A/B: swap used 10.66 GB of 12 GB (heavy, same class as the fnocache A/B day: variance caveat applies).
+[14:35:33] DONE  short_off1
+[14:35:33] START short_on1
+[14:36:11] DONE  short_on1
+[14:36:11] START short_off2
+[14:36:52] DONE  short_off2
+[14:36:52] START short_on2
+[14:37:31] DONE  short_on2
+[14:37:31] START long_off1
+
+RESULT 2 — SHORT A/B (run_streaming, "Explain why the sky is blue in detail",
+96 tok, 8 GB cache, cold process each, interleaved off/on):
+  off1 2.63  on1 2.85  off2 2.58  on2 2.80 tok/s (incl prefill)
+  -> prefetch +8.4% median (2.825 vs 2.605). All 4 outputs byte-identical
+  (single md5 across arms); store hits/misses identical -> clean comparison.
+  NOTE: absolute numbers are page-cache-flattered (chain follows the topk
+  experiment + its own runs; historical cold ~1.9-2.0). Interleaving keeps the
+  off/on comparison fair; the effect replicated in both pairs.
+  Prediction (both on-runs identical, deterministic): hash 0-2 100%
+  (1710/1710); scored 3-15 69.6%; 16-29 74.6%; 30-42 77.2%.
+  pf: issued 12544, served 8179 (7490-7510 ready + 669-689 wait) of 15530
+  decode misses = 52.7% of misses buffer-served; wasted 4365 (34.8%),
+  prefetch traffic 177.6 GB.
+[14:41:15] DONE  long_off1
+[14:41:15] START long_on1
+
+WATCH ITEM (during long pair 1): streamed text of long_on1 appears to DIVERGE
+from long_off1 near decode token ~3 ("Here is summary of document" vs "Here is
+a summary of the document"). Possible identity violation in the long-context
+regime (short 48/96-tok runs were byte-identical, counters equal). Added a
+print-only [ids] token-id dump to chat.py one-shot stats (no math change)
+before long_off2/on2 start, so pair 2 can be compared token-exactly. Will
+compare pair-1 store counters when on1 finishes. If divergence is real, the
+prime suspect is the extra pred ops sharing one mx.eval with the model graph
+flipping a near-tied argmax (cf. memory: batched-shape kernels drift; here
+shapes are unchanged, so this would be new evidence).
+[14:47:53] DONE  long_on1
+[14:47:53] START long_off2
+
+RESULT 3a — LONG PAIR 1 (chat.py, 312-tok prompt, 100 new tok, cold each):
+IDENTITY: PASS — the mid-stream text "divergence" was a display artifact of
+the incremental echo/terminal capture; the durable file texts match and the
+store counters are byte-equal (hits 11987 / misses 20986 / 297.07 GB) ->
+identical routing, identical tokens.
+SPEED: prefetch LOSES in this regime — decode 0.28 tok/s (on) vs 0.60 (off);
+prefill 40.4s vs 50.7s (no prefetch in prefill; that's run noise).
+WHY (mechanism, consistent with the context-scaling probe finding that long-
+context decode is page-cache-cold and BANDWIDTH-bound): prefetch added
+209.6 GB of read traffic (14,809 blob reads, 5,435 of them wasted) on top of
+a saturated pipe; ~70% prediction accuracy means ~30% of issued reads are
+pure extra bytes, and even correct prefetches double-dip bandwidth that
+demand reads would have used anyway. Overlap only pays when reads are cheap
+(page-cache-warm short regime, +8%); when reads are the bottleneck, extra
+bytes are pure loss. Same law as the spec-decode rejection: per-pass cost is
+not fixed in the IO-bound regime.
+Prediction quality (long, on1): hash 100% (1800/1800); scored 3-15 70.6%,
+16-29 69.8%, 30-42 71.1% — accuracy holds at long context; economics don't.
+[14:55:11] DONE  long_off2
+[14:55:11] START long_on2
+[15:01:56] DONE  long_on2
+PREGATE MEASUREMENT CHAIN DONE
+
+RESULT 3b — LONG PAIR 2 + FINAL LONG VERDICT:
+off2: prefill 73.0s, decode 0.28 tok/s. on2: prefill 44.3s, decode 0.28 tok/s.
+IDENTITY: PASS, now token-exact — [ids] dumps of off2 and on2 are md5-identical
+(8c7ce01cfaf125c8b777795ca4b5bf19); store counters byte-equal in all 4 runs.
+SPEED (all long runs): off {0.60, 0.28}, on {0.28, 0.28} tok/s decode.
+The control itself swings 2x under 10.7 GB ambient swap, so pair 1's "2x loss"
+reading is NOT separable from machine noise. Supportable claims: prefetch does
+NOT help the long/bandwidth-bound regime, and directionally it hurts (adds
+209.6 GB / +107% read traffic to a saturated pipe; 5,435 wasted reads); a 2x
+loss is consistent with the data but not proven. Prediction accuracy at long
+context: hash 100%, scored ~70% in every band — accuracy holds; economics
+depend on whether reads are latency-bound (short, page-cache-warm: +8%) or
+bandwidth-bound (long, page-cache-cold: <= 0).
+
+=== FINAL SUMMARY ===
+Built: pre-gated expert prefetch behind DSV4_PREFETCH=1 (default OFF).
+  streaming/expert_store.py (+ExpertPrefetcher, +PrefetchCoordinator,
+  store.get buffer integration, np/mx decode split), model.py token_hook,
+  run_streaming.py wiring, chat.py report+[ids] prints,
+  streaming/test_prefetch.py (6 offline tests, all pass; roundtrip still OK).
+Byte-identity: PASS everywhere (48-tok greedy, 4x96-tok, 2x long-100-tok
+  token-exact; store counters byte-equal in every off/on pair).
+Prediction hit rates (deterministic per workload):
+  hash 0-2: 100.0% in all runs (846/846, 1710/1710, 1800/1800)
+  scored bands, short: 3-15 69.6% | 16-29 74.6% | 30-42 77.2%
+  scored bands, long:  3-15 70.6% | 16-29 69.8% | 30-42 71.1%
+  (matches the 70-90% range reported by Pre-gated MoE papers, at the low end;
+  per-layer spread 0.46-0.87, weakest at early scored layers 3-7 and 19.)
+Prefetch usefulness: 53-68% of decode misses served from the buffer
+  (short 8179/15530, long 9374/13813); served_wait small (99-689) ->
+  reads genuinely complete under compute overlap.
+Speed: short 96-tok freeform +8.4% (2.85/2.80 on vs 2.63/2.58 off, both
+  replicates agree, byte-identical work); long 312-tok+100 no gain,
+  directionally negative (see 3b). Peak memory unchanged (18.2 / 24.2 GB).
+Recommendation: keep DSV4_PREFETCH default OFF; enable for short-form decode
+  only, or gate prefetch on page-cache-warm conditions. The bandwidth ceiling
+  that caps the long regime is the same wall ds4 clears with async staging in
+  C/Metal at 11.4 tok/s — in Python the win is the measured prediction-accuracy
+  table, not throughput.
+CHAIN COMPLETE 15:01:56; all runs caffeinate'd, cold processes, GPU released.

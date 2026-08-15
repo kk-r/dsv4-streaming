@@ -219,6 +219,9 @@ def main():
         print(f"[chat] prefill {stats['prefill_s']}s ({stats['prompt_tokens']} tok), "
               f"decode {stats['decode_tok_s']} tok/s ({stats['new_tokens']} tok) | "
               f"store {store.summary()}", file=sys.stderr)
+        if getattr(store, "coordinator", None) is not None:
+            print(f"[prefetch] {store.coordinator.report()}", file=sys.stderr)
+        print(f"[ids] {stats['out_ids']}", file=sys.stderr)  # exact-output check
         print(f"[mem] peak {mx.get_peak_memory()/1e9:.1f} GB", file=sys.stderr)
         return
 

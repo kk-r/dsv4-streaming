@@ -29,8 +29,8 @@ from deepseek_v4_mlx.config import ModelArgs          # noqa: E402
 from deepseek_v4_mlx.generate import greedy_generate, load_tokenizer  # noqa: E402
 from deepseek_v4_mlx.load import quant_predicate      # noqa: E402
 from deepseek_v4_mlx.model import Model               # noqa: E402
-from expert_store import (ExpertStore, StackedStreamingExperts,  # noqa: E402
-                          StreamingExperts)
+from expert_store import (ExpertStore, PrefetchCoordinator,  # noqa: E402
+                          StackedStreamingExperts, StreamingExperts)
 
 
 def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
@@ -72,10 +72,29 @@ def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
     else:
         store = ExpertStore(os.path.join(repacked, "experts"),
                             cache_bytes=int(cache_gb * 1e9))
+    # Pre-gated expert prefetch (DSV4_PREFETCH=1, lru store only): hash layers
+    # 0-2 are prefetched exactly from the token id at token start; each scored
+    # layer L predicts L+1's routing by applying L+1's resident gate to its own
+    # MoE input, then fetches the predicted-missing blobs async while L's
+    # experts and L+1's attention compute. Timing-only: routing, math and LRU
+    # residency are untouched (mispredictions never enter the cache).
+    prefetch_on = (os.environ.get("DSV4_PREFETCH", "0") == "1"
+                   and experts_cls is StreamingExperts)
+    coord = None
+    if prefetch_on:
+        workers = int(os.environ.get("DSV4_PREFETCH_WORKERS", "6"))
+        coord = PrefetchCoordinator(store, workers=workers)
+        print(f"[prefetch] pre-gated prefetch ON ({workers} workers)")
     for i, layer in enumerate(model.layers):
+        kw = {}
+        if coord is not None:
+            nxt = i + 1
+            kw["coordinator"] = coord
+            if nxt < args.n_layers and not args.is_hash_layer(nxt):
+                kw["next_gate"] = model.layers[nxt].ffn.gate
         layer.ffn.experts = experts_cls(
             store, i, group_size=q["group_size"], bits=q.get("expert_bits", 4),
-            limit=args.swiglu_limit)
+            limit=args.swiglu_limit, **kw)
 
     expected = {k for k, _ in tree_flatten(model.parameters())}
     loaded = set()
@@ -91,6 +110,12 @@ def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
         raise ValueError(f"{len(missing)} resident params missing, "
                          f"e.g. {sorted(missing)[:3]}")
     model.eval()
+    if coord is not None:
+        # After weights load: snapshot the hash tables to CPU and install the
+        # decode-time hook that prefetches layers 0-2 from the token id.
+        coord.register_hash_layers(
+            {i: model.layers[i].ffn.gate for i in range(args.n_hash_layers)})
+        model.token_hook = coord.token_start
     print(f"[load] resident weights in {time.time()-t0:.1f}s "
           f"({mx.get_active_memory()/1e9:.1f} GB active)")
     return model, args, store
@@ -131,6 +156,8 @@ def main():
     print(f"[gen] {len(new)} new tokens in {dt:.1f}s -> {len(new)/dt:.2f} tok/s "
           f"(prefill included)")
     print(f"[store] {store.summary()}")
+    if store.coordinator is not None:
+        print(f"[prefetch] {store.coordinator.report()}")
     per_layer = {k: dict(v) for k, v in sorted(store.stats.items())}
     json.dump(per_layer, open(os.path.join(os.path.dirname(__file__), "..",
                                            "logs", "hitrate_last_run.json"), "w"),

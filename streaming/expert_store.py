@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import threading
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,6 +51,188 @@ class LayerFile:
 
     def read_blob_nocache(self, expert_id):
         return os.pread(self.fd_nocache, self.stride, expert_id * self.stride)
+
+
+def _decode_np(lf: LayerFile, blob: bytes) -> dict:
+    """Decode a blob into numpy views — NO MLX, safe off the main thread.
+
+    Returns {slice_name: (np_array, is_bf16)}. BF16 stays a uint16 view; the
+    mx.bfloat16 reinterpret happens in _wrap_np on the main thread.
+    """
+    out = {}
+    for key, s in lf.slices.items():
+        dt = NP_DTYPE[s["dtype"]]
+        arr = np.frombuffer(blob, dtype=dt,
+                            count=s["nbytes"] // np.dtype(dt).itemsize,
+                            offset=s["offset"]).reshape(s["shape"])
+        out[key] = (arr, s["dtype"] == "BF16")
+    return out
+
+
+def _wrap_np(np_entry: dict) -> dict:
+    """np entry -> dict of mx arrays. MAIN THREAD ONLY (MLX streams are
+    thread-bound; creating mx arrays off-thread is the known crash class)."""
+    out = {}
+    for key, (arr, is_bf16) in np_entry.items():
+        a = mx.array(arr)
+        out[key] = a.view(mx.bfloat16) if is_bf16 else a
+    return out
+
+
+class ExpertPrefetcher:
+    """Async SSD prefetch of predicted experts.
+
+    Worker threads do os.pread (page-cached fd, positionless — thread-safe)
+    plus the numpy view decode, and park the result in a buffer dict keyed
+    (layer, expert). They never touch MLX. The main thread drains entries via
+    take() at the point a miss actually needs them; unpredicted-but-fetched
+    entries are purged (counted wasted) and never enter the LRU, so cache
+    residency and eviction order stay byte-identical to a prefetch-free run.
+    """
+
+    def __init__(self, store: "ExpertStore", workers: int = 6):
+        self.store = store
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.lock = threading.Lock()
+        self.buf = {}       # (layer, expert) -> np entry, decoded and ready
+        self.futures = {}   # (layer, expert) -> Future, read in flight
+        self.issued = 0         # reads submitted
+        self.served_ready = 0   # miss served from a completed prefetch
+        self.served_wait = 0    # miss waited on an in-flight prefetch read
+        self.wasted = 0         # fetched (or in flight) but purged unused
+        self.bytes_read = 0     # bytes submitted for prefetch reads
+
+    def request(self, layer: int, expert_ids):
+        """Issue async reads for the given experts, skipping LRU-cached and
+        already-requested ones. Main thread only."""
+        lf = self.store.layers[layer]
+        for e in expert_ids:
+            key = (layer, int(e))
+            if key in self.store.cache:
+                continue
+            with self.lock:
+                if key in self.buf or key in self.futures:
+                    continue
+                self.issued += 1
+                self.bytes_read += lf.stride
+                self.futures[key] = self.pool.submit(self._fetch, key, lf)
+
+    def _fetch(self, key, lf):
+        # WORKER THREAD: pread + numpy only.
+        blob = os.pread(lf.f.fileno(), lf.stride, key[1] * lf.stride)
+        entry = _decode_np(lf, blob)
+        with self.lock:
+            if key in self.futures:     # not taken/purged mid-flight
+                self.buf[key] = entry
+                del self.futures[key]   # a key lives in buf XOR futures
+        return entry
+
+    def take(self, layer: int, expert_id: int):
+        """Return the np entry for a key, or None if never prefetched.
+        Waits on an in-flight read rather than restarting it. Main thread."""
+        key = (layer, expert_id)
+        with self.lock:
+            fut = self.futures.pop(key, None)   # popping stops _fetch's buf insert
+            entry = self.buf.pop(key, None)
+        if entry is not None:
+            self.served_ready += 1
+            return entry
+        if fut is not None:
+            entry = fut.result()                # already reading; wait, don't redo
+            with self.lock:
+                self.buf.pop(key, None)         # in case _fetch won the race
+            self.served_wait += 1
+            return entry
+        return None
+
+    def purge(self, layer: int | None = None):
+        """Drop unused entries (all layers, or one). Mispredictions die here."""
+        with self.lock:
+            doomed = [k for k in self.buf if layer is None or k[0] == layer]
+            for k in doomed:
+                del self.buf[k]
+            inflight = [k for k in self.futures if layer is None or k[0] == layer]
+            for k in inflight:
+                self.futures.pop(k)             # _fetch will drop its result
+            self.wasted += len(doomed) + len(inflight)
+
+    def counters(self) -> dict:
+        return {"pf_issued": self.issued, "pf_served_ready": self.served_ready,
+                "pf_served_wait": self.served_wait, "pf_wasted": self.wasted,
+                "pf_read_gb": round(self.bytes_read / 1e9, 2)}
+
+
+class PrefetchCoordinator:
+    """Pre-gated prefetch prediction (Pre-gated MoE / Mixtral-offloading style).
+
+    Two prediction sources, both exact-cost-free on the decode critical path:
+
+    * hash layers 0..n_hash-1: EXACT — routing is tid2eid[token_id], known at
+      token start. token_start() fires from Model.token_hook before the
+      forward begins, so these reads overlap embedding + early attention.
+    * scored layer L+1: APPROXIMATE — L+1's resident gate applied to layer L's
+      MoE input xf (papers: hidden states change slowly across layers). The
+      gate matmul is folded into layer L's existing per-layer sync
+      (mx.eval(indices, pred) — still ONE sync), then reads are issued async
+      and overlap layer L's expert FFN + L+1's attention.
+
+    Prediction accuracy is scored per layer (pred_hit/pred_total) against the
+    routing the model actually performs.
+    """
+
+    def __init__(self, store: "ExpertStore", workers: int = 6):
+        self.store = store
+        self.prefetcher = ExpertPrefetcher(store, workers=workers)
+        store.prefetcher = self.prefetcher
+        store.coordinator = self
+        self.predicted = {}     # layer -> set of predicted expert ids (this token)
+        self.pred_stats = defaultdict(lambda: {"pred_hit": 0, "pred_total": 0})
+        self.hash_tables = {}   # layer -> np tid2eid [vocab, topk]
+
+    def register_hash_layers(self, gates: dict):
+        """gates: {layer_id: Gate module with .tid2eid}. Call after weights load;
+        keeps a CPU copy (~3 MB/layer) so token_start needs no MLX work."""
+        for layer, gate in gates.items():
+            self.hash_tables[layer] = np.asarray(gate.tid2eid)
+
+    def token_start(self, input_ids):
+        """Model.token_hook: fires at the top of a single-token forward."""
+        tid = int(input_ids[0, 0].item())
+        self.prefetcher.purge()             # stale leftovers from the last token
+        self.predicted.clear()
+        for layer, table in self.hash_tables.items():
+            self.predict(layer, [int(v) for v in table[tid]])
+
+    def predict(self, layer: int, expert_ids):
+        self.predicted[layer] = set(expert_ids)
+        self.prefetcher.request(layer, expert_ids)
+
+    def observe_actual(self, layer: int, actual_ids):
+        """Score the prediction for this layer against actual routing."""
+        pred = self.predicted.pop(layer, None)
+        if pred is None:
+            return
+        st = self.pred_stats[layer]
+        st["pred_hit"] += len(pred & set(actual_ids))
+        st["pred_total"] += len(actual_ids)
+
+    def layer_done(self, layer: int):
+        """After a layer's expert accesses: drop its unused prefetches."""
+        self.prefetcher.purge(layer)
+
+    def report(self) -> str:
+        lines = []
+        bands = {"hash 0-2": range(0, 3), "scored 3-15": range(3, 16),
+                 "scored 16-29": range(16, 30), "scored 30-42": range(30, 43)}
+        for name, rng in bands.items():
+            h = sum(self.pred_stats[l]["pred_hit"] for l in rng if l in self.pred_stats)
+            t = sum(self.pred_stats[l]["pred_total"] for l in rng if l in self.pred_stats)
+            if t:
+                lines.append(f"{name}: {h}/{t} = {h/t:.3f}")
+        per_layer = {l: round(s["pred_hit"] / s["pred_total"], 4)
+                     for l, s in sorted(self.pred_stats.items()) if s["pred_total"]}
+        return (f"pred hit rate by band: {'; '.join(lines)} | "
+                f"prefetcher {self.prefetcher.counters()} | per-layer {per_layer}")
 
 
 class ExpertStore:
@@ -95,6 +278,13 @@ class ExpertStore:
         # get_many() only by batched prefill, so this splits the aggregate
         # stats by phase without touching the callers.
         self.decode_stats = {"hits": 0, "misses": 0, "bytes": 0}
+        # Optional pre-gated prefetcher (DSV4_PREFETCH=1): set by
+        # PrefetchCoordinator. When present, get() consults its buffer before
+        # touching the disk; a served miss is still a miss in every counter
+        # (the read happened, just earlier and off-thread).
+        self.prefetcher = None
+        self.coordinator = None
+        self.prefetch_served = 0
         print(f"[store] prefill (get_many) reads: "
               f"{'F_NOCACHE' if self.prefill_nocache else 'page-cached'}; "
               f"insert policy: "
@@ -154,18 +344,7 @@ class ExpertStore:
         return out
 
     def _decode(self, layer, blob):
-        lf = self.layers[layer]
-        out = {}
-        for key, s in lf.slices.items():
-            dt = NP_DTYPE[s["dtype"]]
-            arr = np.frombuffer(blob, dtype=dt,
-                                count=s["nbytes"] // np.dtype(dt).itemsize,
-                                offset=s["offset"]).reshape(s["shape"])
-            if s["dtype"] == "BF16":
-                out[key] = mx.array(arr).view(mx.bfloat16)
-            else:
-                out[key] = mx.array(arr)
-        return out
+        return _wrap_np(_decode_np(self.layers[layer], blob))
 
     def get(self, layer, expert_id):
         key = (layer, expert_id)
@@ -180,7 +359,14 @@ class ExpertStore:
         lf = self.layers[layer]
         st["bytes"] += lf.stride
         self.decode_stats["bytes"] += lf.stride
-        entry = self._decode(layer, lf.read_blob(expert_id))
+        entry = None
+        if self.prefetcher is not None:
+            np_entry = self.prefetcher.take(layer, expert_id)
+            if np_entry is not None:
+                self.prefetch_served += 1
+                entry = _wrap_np(np_entry)   # main thread: np -> mx here only
+        if entry is None:
+            entry = self._decode(layer, lf.read_blob(expert_id))
         self.cache[key] = entry
         self.used += lf.stride
         while self.used > self.capacity and len(self.cache) > 1:
@@ -193,12 +379,16 @@ class ExpertStore:
         m = sum(s["misses"] for s in self.stats.values())
         gb = sum(s["bytes"] for s in self.stats.values()) / 1e9
         rate = h / (h + m) if h + m else 0.0
-        return {"hits": h, "misses": m, "hit_rate": round(rate, 4),
-                "read_gb": round(gb, 2), "cached_gb": round(self.used / 1e9, 2),
-                "decode_hits": self.decode_stats["hits"],
-                "decode_misses": self.decode_stats["misses"],
-                "decode_read_gb": round(self.decode_stats["bytes"] / 1e9, 2),
-                "noevict_skipped": self.noevict_skipped}
+        out = {"hits": h, "misses": m, "hit_rate": round(rate, 4),
+               "read_gb": round(gb, 2), "cached_gb": round(self.used / 1e9, 2),
+               "decode_hits": self.decode_stats["hits"],
+               "decode_misses": self.decode_stats["misses"],
+               "decode_read_gb": round(self.decode_stats["bytes"] / 1e9, 2),
+               "noevict_skipped": self.noevict_skipped}
+        if self.prefetcher is not None:
+            out["pf_served"] = self.prefetch_served
+            out.update(self.prefetcher.counters())
+        return out
 
 
 class StreamingExperts:
@@ -212,10 +402,16 @@ class StreamingExperts:
     """
 
     def __init__(self, store: ExpertStore, layer: int, group_size=64, bits=4,
-                 limit: float = 0.0):
+                 limit: float = 0.0, coordinator: PrefetchCoordinator | None = None,
+                 next_gate=None):
         self.store, self.layer = store, layer
         self.group_size, self.bits = group_size, bits
         self.limit = limit
+        # Pre-gated prefetch (DSV4_PREFETCH=1): next_gate is layer L+1's
+        # resident Gate module (scored layers only); applying it to this
+        # layer's MoE input xf approximates L+1's routing one layer early.
+        self.coordinator = coordinator
+        self.next_gate = next_gate
         self._stacked = StackedStreamingExperts(store, layer, group_size=group_size,
                                                 bits=bits, limit=limit)
 
@@ -228,7 +424,19 @@ class StreamingExperts:
         # x [tokens, dim], indices [tokens, topk] -> [tokens, topk, dim]
         if x.shape[0] > 1:          # prefill: batch the visits through gather_qmm
             return self._stacked(x, indices)
+        coord = self.coordinator
+        pred = None
+        if coord is not None and self.next_gate is not None:
+            # L+1's gate on L's MoE input — tiny matmul, folded into the
+            # per-layer sync that HEAD already pays (ONE eval, not two).
+            _, pred = self.next_gate(x)
+            mx.eval(indices, pred)
         idx = np.asarray(indices)
+        if coord is not None:
+            if pred is not None:
+                coord.predict(self.layer + 1,
+                              [int(v) for v in np.asarray(pred).reshape(-1)])
+            coord.observe_actual(self.layer, [int(v) for v in idx.reshape(-1)])
         outs = []
         for t in range(idx.shape[0]):
             row = []
@@ -243,6 +451,8 @@ class StreamingExperts:
                 h = (mx.sigmoid(gate) * gate * up).astype(x.dtype)
                 row.append(self._proj(h, e, "down_proj"))
             outs.append(mx.concatenate(row, axis=0))
+        if coord is not None:
+            coord.layer_done(self.layer)   # purge this layer's mispredictions
         return mx.stack(outs)
 
 
