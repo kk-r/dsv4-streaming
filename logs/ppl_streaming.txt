@@ -36,3 +36,12 @@ Throughput: 3.67 tok/s teacher-forced prefill (253-307 s/window), peak MLX mem
 by page cache/SSD), 1016.75 GB total read.
 Swap note: ambient swap grew 7.6 GB used (9 GB total) -> 25.2 GB used (30.7 GB
 total) over the run; ppl is timing-insensitive so this does not affect the result.
+=== ppl_streaming start 2026-08-15 14:20:18 ===
+corpus /Users/kk/work/research/dsv4-streaming/streaming/../logs/ppl_corpus.npy (200,000 tokens, 195 windows available); running first 4 windows x 1024 tokens; cache 8.0 GB, store lru
+[load] done in 0.8s
+[win 1/4] nll_sum 1501.78 over 1023 tok  ppl 4.3406  cumulative ppl 4.3406  73s (14.11 tok/s)  store {'hits': 0, 'misses': 7749, 'hit_rate': 0.0, 'read_gb': 109.69, 'cached_gb': 8.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 7184}  mem peak 24.7 GB
+[win 2/4] nll_sum 1301.82 over 1023 tok  ppl 3.5699  cumulative ppl 3.9365  95s (10.77 tok/s)  store {'hits': 565, 'misses': 15236, 'hit_rate': 0.0358, 'read_gb': 215.68, 'cached_gb': 8.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 14671}  mem peak 25.2 GB
+[win 3/4] nll_sum 1220.84 over 1023 tok  ppl 3.2982  cumulative ppl 3.7111  86s (11.98 tok/s)  store {'hits': 1130, 'misses': 22168, 'hit_rate': 0.0485, 'read_gb': 313.81, 'cached_gb': 8.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 21603}  mem peak 25.3 GB
+[win 4/4] nll_sum 1359.33 over 1023 tok  ppl 3.7764  cumulative ppl 3.7273  83s (12.36 tok/s)  store {'hits': 1695, 'misses': 29250, 'hit_rate': 0.0548, 'read_gb': 414.06, 'cached_gb': 8.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 28685}  mem peak 25.3 GB
+[done] aggregate ppl 3.7273 over 4,092 scored tokens (4 windows x 1024)  total 336s (12.19 tok/s incl load-excluded)
+[json] {"windows": 4, "seq": 1024, "cache_gb": 8.0, "window_nll": [1501.776611328125, 1301.81787109375, 1220.83642578125, 1359.3323974609375], "window_tok": [1023, 1023, 1023, 1023], "ppl": 3.727285356482777, "seconds": 336.04725980758667}

@@ -5,3 +5,4 @@ deepseek-v4-mlx/
 __pycache__/
 *.pyc
 .DS_Store
+ds4-runtime/
