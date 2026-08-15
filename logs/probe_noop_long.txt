@@ -1,0 +1,20 @@
+[store] prefill (get_many) reads: page-cached; insert policy: fill-no-evict
+[load] resident weights in 0.3s (9.4 GB active)
+[gen] prompt: 308 tokens; cache budget 1.0 GB
+[gen] prefilled 308 tokens
+[gen] run 1: 100 tokens in 15.9s -> 6.27 tok/s | store {'hits': 0, 'misses': 0, 'hit_rate': 0.0, 'read_gb': 0.0, 'cached_gb': 0.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 0}
+
+=== output ===
+Summarize the following document:
+
+# dsv4-streaming
+
+SSD expert streaming for DeepSeek-V4-Flash (284B sparse MoE) on a 64 GB M5 Pro MacBook.
+
+DeepSeek-V4-Flash is 284B total / ~13.8B active parameters; at mixed 4/8-bit quantization the checkpoint is 165 GB, and no published quant fits a 64 GB Mac (smallest GGUF is 83 GB, smallest MLX 92.7 GB). This project keeps the ~9.4 GB of non-expert weights resident and streams the 155.8 GB of routed-expert weights from SSD on demand, with an LRU cache in unified memory — the approach [drumih/turbo-fieldfare](https://github.com/drumih/turbo-fieldfare) demonstrated for a 26B Gemma, scaled up 10x. It is built on the [PipeNetwork/deepseek-v4-mlx](https://github.com/PipeNetwork/deepseek-v4-mlx) from-scratch MLX port, because no mainstream runtime supports the `deepseek_v4` architecture (mlx-lm PR #1189 still open at time of writing).
+
+**Current status.** The build arc is complete. Works today: interactive chat via `streaming/chat.py` at ~1–2 tok/s for short-form use, at full mixed 4/8-bit quality, under 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit) 24 GB pe-4-8-bit (4/8-bit
+==============
+[gen] 100 new tokens in 15.9s -> 6.27 tok/s (prefill included)
+[store] {'hits': 0, 'misses': 0, 'hit_rate': 0.0, 'read_gb': 0.0, 'cached_gb': 0.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 0}
+[mem] active 9.4 GB, peak 19.0 GB

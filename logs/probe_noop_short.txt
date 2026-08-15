@@ -1,0 +1,12 @@
+[store] prefill (get_many) reads: page-cached; insert policy: fill-no-evict
+[load] resident weights in 1.2s (9.4 GB active)
+[gen] prompt: 5 tokens; cache budget 1.0 GB
+[gen] prefilled 5 tokens
+[gen] run 1: 100 tokens in 13.3s -> 7.53 tok/s | store {'hits': 0, 'misses': 0, 'hit_rate': 0.0, 'read_gb': 0.0, 'cached_gb': 0.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 0}
+
+=== output ===
+The capital of France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital of France? France is the capital
+==============
+[gen] 100 new tokens in 13.3s -> 7.53 tok/s (prefill included)
+[store] {'hits': 0, 'misses': 0, 'hit_rate': 0.0, 'read_gb': 0.0, 'cached_gb': 0.0, 'decode_hits': 0, 'decode_misses': 0, 'decode_read_gb': 0.0, 'noevict_skipped': 0}
+[mem] active 9.4 GB, peak 9.7 GB
