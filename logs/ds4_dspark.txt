@@ -1,0 +1,17 @@
+=== ctl-short ===
+1.  **Analyze the User's Request**: The user asks "Why is the sky blue?" and specifically requests "Answer in detail." This requires a comprehensive, scientifically accurate, yet accessible explanation of Rayleigh scattering, atmospheric composition, and the physics of light.
+ds4: prefill: 7.97 t/s, generation: 9.00 t/s
+=== dspark-short ===
+ds4: --dspark requires --mtp FILE
+=== ctl-long ===
+ds4: prefill: 38.82 t/s, generation: 8.88 t/s
+=== dspark-long ===
+ds4: --dspark requires --mtp FILE
+=== dspark-short-rep ===
+ds4: --dspark requires --mtp FILE
+=== dspark-short (with --mtp) ===
+ds4: --ssd-streaming is not compatible with --mtp yet
+=== dspark-long (with --mtp) ===
+ds4: --ssd-streaming is not compatible with --mtp yet
+=== dspark-short-rep (with --mtp) ===
+ds4: --ssd-streaming is not compatible with --mtp yet
