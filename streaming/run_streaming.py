@@ -36,6 +36,13 @@ from expert_store import (ExpertStore, StackedStreamingExperts,  # noqa: E402
 def load_streaming(repacked: str, cache_gb: float, store_kind: str = "lru"):
     cfg = json.load(open(os.path.join(repacked, "config.json")))
     args = ModelArgs.from_dict(cfg)
+    # Inference-time top-k override (DSV4_TOPK=4 serves top-4 of the trained
+    # top-6): each expert dropped cuts decode reads ~17%; quality cost is
+    # measured in logs/topk_experiment.txt before trusting it.
+    tk = int(os.environ.get("DSV4_TOPK", "0"))
+    if tk:
+        args.n_activated_experts = tk
+        print(f"[model] top-k override: {tk} of trained 6")
     q = cfg["quantization"]
 
     model = Model(args)
