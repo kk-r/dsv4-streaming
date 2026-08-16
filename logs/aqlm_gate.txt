@@ -1,0 +1,111 @@
+=== AQLM week-1 quality gate ===
+Question: do learned-codebook 2-bit experts (AQLM-class, arXiv 2401.06118) hold quality
+near the 4-bit baseline where affine 2-bit collapses? If yes -> expert bytes halve ->
+~2x decode headroom -> Metal kernel worth writing. If no -> kill the track.
+
+Source caveat (pre-registered): the FP4/FP8 original checkpoint is deleted; the only
+weight source is the repacked mixed-4/8 (4-bit affine experts, group 64). Quantizing
+from dequantized-4-bit stacks error-on-error, so every ppl here is an UPPER BOUND on
+what codebook-2bit from the true source would do. A pass from degraded source is a
+stronger pass.
+
+Method: 6 contiguous mid layers (18-23), all 256 experts x 3 projections each,
+dequantized to fp32 and re-quantized three ways, served back through the normal
+streaming store in the 4-bit affine container (justification: arm A measures exactly
+the container roundtrip error; if arm A ~= baseline, the container is transparent and
+arms B/C isolate the quantizer). Other 37 layers untouched.
+
+Arms:
+  A control:      dequant fp32 -> mx.quantize(bits=4, g64) -> container  (plumbing only)
+  B codebook-2bit: dequant fp32 -> additive VQ: vectors of 8 consecutive weights,
+                   2 codebooks x 256 entries (16 bits / 8 weights = 2.0 bits/weight),
+                   k-means init + alternating refinement, per-output-channel LS scale
+                   -> reconstruct fp32 -> mx.quantize(bits=4, g64) -> container
+  C affine-2bit:  dequant fp32 -> mx.quantize(bits=2, g64) -> dequant -> mx.quantize(bits=4) -> container
+Weight-only objective (no activation calibration) — full AQLM adds activation-aware
+calibration on top, i.e. further upside beyond whatever B shows here.
+
+Eval: ppl_streaming.py, wikitext-2 windows 1-8 (8184 scored tokens), 8 GB cache.
+Baseline all-normal-layers = 3.9492 (logs/ppl_streaming.txt, commit b9374ec).
+
+PRE-REGISTERED GATE CRITERIA (decided before any run):
+  PASS: arm B within ~1-2% of arm A, AND arm C markedly worse
+        (C must be clearly worse or the test is underpowered -> extend to 12 layers
+        before concluding anything).
+  KILL: arm B degrades >5% over arm A on the subset.
+
+--- progress log follows ---
+[phase 1] pipeline validation on layer 18 expert 0 — PASS (aqlm/validate_one.py)
+  - manual numpy dequant == mx.dequantize: bit-exact, all 3 projections
+  - blob rebuild roundtrip: bit-exact (weights + scales)
+  - rel MSE per arm (gate/up/down):
+      A container roundtrip: 2.86e-3 / 3.10e-3 / 3.25e-3   (plumbing error, small)
+      B codebook 2-bit:      1.07e-1 / 1.06e-1 / 1.07e-1   (2.7 s/projection, both codebooks fully utilized)
+      C affine 2-bit:        1.49e-1 / 1.51e-1 / 1.52e-1   (known-bad comparator)
+  - reference ladder (gate_proj): affine2b 0.149 > codebook2b 0.106 > affine3b 0.040 > affine4b 0.0029
+  - refinement converged: refine=6 passes 0.10636, 14 passes 0.10594 (0.4% — not worth)
+  - NOTE pre-run: weight-MSE gap B-vs-C is 1.4x, smaller than hoped; ppl will decide.
+[decision] serving = reconstruct -> re-enter the 4-bit affine container, eval through the
+  UNMODIFIED store/model path. Justification: arm A measures the container roundtrip
+  in isolation; if arm A ppl ~= baseline 3.9492 the container is transparent and any
+  B/C delta is the quantizer. Avoids a bf16 bypass matmul path (new untested code on
+  the eval path) entirely.
+[phase 2] batch quantization
+  - arm A (container control): 6 layers x 256 experts in ~6 s/layer. done.
+  - arm C (affine 2-bit):      6 layers x 256 experts in ~12 s/layer. done.
+  - arm B (codebook 2-bit):    running, 10 workers, ~1.9 s/expert amortized
+    (~19 s/expert/worker, ~8 min/layer, ETA ~48 min for 6 layers). Checkpointed
+    per layer via progress.json; per-expert MSE -> aqlm/out_B/mse.jsonl.
+[phase 3] eval plan: ppl windows 1-8, 8 GB cache, one GPU job at a time, caffeinate,
+  60 min bound each. Arm A eval STARTED (concurrent with arm B CPU build — B is
+  CPU-only; ppl is deterministic, only wall clock can contend).
+[eval arm A] DONE (2415 s, 3.39 tok/s, peak 25.3 GB). Windows:
+  4.0564 3.0535 2.5606 3.0879 3.1013 4.9687 6.4771 6.0416
+  aggregate 3.9483 vs baseline 3.9492 = -0.02% -> CONTAINER ROUNDTRIP TRANSPARENT.
+  Serving-via-container decision validated; arms B/C deltas are pure quantizer effect.
+[eval arm C] DONE (2075 s). Windows:
+  4.2190 3.3894 3.0992 3.7147 3.6995 5.5202 6.5624 6.1551
+  aggregate 4.3814 = +10.97% over arm A (3.9483) with only 6/43 layers touched.
+  -> comparator clearly detected: test is POWERED at 6 layers (no 12-layer extension needed).
+[phase 2 complete] arm B build wall-clock: 4472 s (74.5 min) for 6 layers x 256 experts
+  x 3 projections at 10 workers (CPU contended with concurrent GPU eval);
+  28.7 s/expert worker-serial. Extrapolation to all 43 layers: ~8.9 h at 10 workers
+  as-measured; ~6 h uncontended. Arms A/C: seconds per layer.
+[recon error, mean rel MSE over 1536 experts (quant-only -> final incl container)]
+  arm B gate 0.1063->0.1130  up 0.1063->0.1129  down 0.1068->0.1135  (spread ±1%)
+  arm C gate 0.1490->0.1489  up 0.1503->0.1501  down 0.1518->0.1517
+[eval arm B] STARTED (codebook 2-bit, the decisive run).
+[eval arm B] DONE (611 s — page cache warm from prior runs). Windows:
+  4.0688 3.4352 2.8957 3.4756 3.7621 5.4123 6.6092 6.4214
+  aggregate 4.3211 = +9.44% over arm A.
+
+=== THREE-ARM RESULT (wikitext-2 windows 1-8, 8184 scored tokens, layers 18-23 only) ===
+  baseline (all-normal)        3.9492
+  arm A  container control     3.9483   -0.02% vs baseline  (plumbing transparent)
+  arm B  codebook 2-bit        4.3211   +9.44% vs arm A
+  arm C  affine 2-bit          4.3814  +10.97% vs arm A
+  per-window B vs A (%): 0.3 12.5 13.1 12.6 21.3 8.9 2.0 6.3
+  per-window C vs A (%): 4.0 11.0 21.0 20.3 19.3 11.1 1.3 1.9
+
+=== GATE VERDICT: KILL ===
+  Pre-registered PASS required arm B within ~1-2% of arm A; pre-registered KILL was
+  >5% degradation. Measured: +9.44% -> KILL. The test was powered (arm C +10.97%
+  clearly detected at 6 layers; no 12-layer extension needed). Codebook 2-bit
+  recovered only ~14% of the affine-2bit ppl damage (4.3211 vs 4.3814 against A's
+  3.9483) despite 25% lower weight MSE (0.113 vs 0.150) — the weight-MSE advantage
+  does not translate into perplexity on this model.
+  Naive compounding extrapolation to all 43 layers: x1.91 -> full-corpus ppl ~11.7
+  (vs 6.125 published) for arm B; ~12.9 for arm C. Both unacceptable.
+  Upper-bound caveat (pre-registered): source weights were already 4-bit affine
+  (original FP4/FP8 checkpoint deleted), so these numbers are an upper bound on ppl;
+  a KILL from degraded source is weaker than a KILL from true source would be, BUT
+  the miss is ~5-9x the pass band, far beyond what error-stacking plausibly explains
+  (arm A shows the stacking path itself costs ~nothing).
+  Untested upside noted for the record: full AQLM adds activation-aware calibration
+  + per-layer finetuning; weight-only was the pre-registered week-1 objective.
+  Metal-kernel phase: MOOT (gate killed the track).
+
+Artifacts kept: aqlm/{aqlm_lib,run_arm,validate_one}.py, aqlm/out_{A,B,C}/ (65 GB,
+rebuilt layer files + mse.jsonl), aqlm/hybrid_{A,B,C}/ (symlink dirs),
+logs/aqlm_arm{A,B,C}_ppl.txt (raw window logs). Nothing committed.
+=== gate complete 2026-08-16 ===
