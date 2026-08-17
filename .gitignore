@@ -1,5 +1,6 @@
 repacked/
 logs/
+data/
 bench/
 deepseek-v4-mlx/
 __pycache__/

@@ -78,7 +78,8 @@ def make_sampler(temp: float, top_p: float):
 
 def generate_turn(model, args, tok, prompt_ids, sampler, stops,
                   max_new: int = 512, thinking_mode: str = "chat",
-                  echo: bool = True, cache=None, prefix_len: int = 0):
+                  echo: bool = True, cache=None, prefix_len: int = 0,
+                  stop_event=None):
     """Generate one assistant turn. Returns (text, hit_eos, stats dict).
 
     Streams decoded text to stdout as it arrives (reasoning dimmed in thinking
@@ -111,11 +112,14 @@ def generate_turn(model, args, tok, prompt_ids, sampler, stops,
     nxt = sampler(logits[0, -1])
     prefill_s = time.time() - t0
 
-    out, hit_eos = [], False
+    out, hit_eos, stopped = [], False, False
     in_reasoning = thinking_mode == "thinking"
     emitted = 0
     t1 = time.time()
     for _ in range(max_new):
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
         if nxt in stops:
             hit_eos = nxt == EOS_ID
             break
@@ -143,6 +147,7 @@ def generate_turn(model, args, tok, prompt_ids, sampler, stops,
              "decode_tok_s": round(len(out) / decode_s, 2) if decode_s > 0 else 0.0,
              "reused_tokens": prefix_len,
              "processed_tokens": len(prompt_ids) - prefix_len,
+             "stopped": stopped,
              "out_ids": out}
     return tok.decode(out), hit_eos, stats
 
