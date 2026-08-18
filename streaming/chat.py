@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from deepseek_v4_mlx import encoding_dsv4 as E   # noqa: E402
 from deepseek_v4_mlx.cache import make_cache     # noqa: E402
 from deepseek_v4_mlx.generate import load_tokenizer  # noqa: E402
+from kv_append import append_tokens, model_store  # noqa: E402
 from run_streaming import load_streaming         # noqa: E402
 
 EOS_ID = 1  # generation_config.json; == tokenizer id of E.eos_token
@@ -88,14 +89,17 @@ def generate_turn(model, args, tok, prompt_ids, sampler, stops,
 
     ``cache``/``prefix_len`` support conversation KV reuse (serve.py): pass a
     cache whose first ``prefix_len`` positions already hold KV for
-    ``prompt_ids[:prefix_len]`` and only the suffix is processed. The suffix
-    goes through the DECODE path one token at a time, not batched prefill:
-    the prefill branch of attention assigns absolute positions 0..s-1 and
-    reseeds the window ring + compressor/indexer state from scratch
-    (``Attention._seed_cache``), so it cannot extend a nonzero offset.
-    Decode-append is correct by construction — it is exactly what generation
-    already does — and a typical user turn is 10-100 tokens, far cheaper than
-    re-prefilling the whole conversation.
+    ``prompt_ids[:prefix_len]`` and only the suffix is processed. Batched
+    prefill cannot be used for the suffix: the prefill branch of attention
+    assigns absolute positions 0..s-1 and reseeds the window ring +
+    compressor/indexer state from scratch (``Attention._seed_cache``), so it
+    cannot extend a nonzero offset. The suffix instead goes through
+    ``kv_append.append_tokens`` — the spec verifier's teacher-forced exact
+    forward (decode-shape kernels per token, bitwise-identical to sequential
+    decode-append, but only 43 per-layer index syncs per chunk instead of 43
+    per token, plus parallel get_many SSD reads). DSV4_SUFFIX_APPEND=decode
+    falls back to the old one-token-at-a-time decode loop (A/B control);
+    DSV4_APPEND_CHUNK sets the tokens-per-pass bound (default 32).
     """
     assert 0 <= prefix_len < len(prompt_ids)
     if cache is None:
@@ -104,9 +108,16 @@ def generate_turn(model, args, tok, prompt_ids, sampler, stops,
 
     t0 = time.time()
     if prefix_len:
-        for t in prompt_ids[prefix_len:]:
-            logits = model(mx.array([[t]]), last_logit_only=True, cache=cache)
-            mx.eval(logits)  # bound the lazy graph per token, as decode does
+        suffix = prompt_ids[prefix_len:]
+        batch_ok = (os.environ.get("DSV4_SUFFIX_APPEND", "batch") == "batch"
+                    and model_store(model) is not None)
+        if batch_ok:
+            chunk = int(os.environ.get("DSV4_APPEND_CHUNK", "32"))
+            logits = append_tokens(model, cache, suffix, chunk=chunk)
+        else:
+            for t in suffix:
+                logits = model(mx.array([[t]]), last_logit_only=True, cache=cache)
+                mx.eval(logits)  # bound the lazy graph per token, as decode does
     else:
         logits = model(mx.array([prompt_ids]), last_logit_only=True, cache=cache)
     nxt = sampler(logits[0, -1])

@@ -1,0 +1,13 @@
+[store] prefill (get_many) reads: page-cached; insert policy: fill-no-evict
+[load] resident weights in 0.8s (9.4 GB active)
+=== gates-conv: short conversation, max_new 32, control (decode) first ===
+[decode] turn 1: prompt 10 tok (suffix 10), ttft 3.1s, total 14.5s, decode 2.82 tok/s
+[decode] turn 2: prompt 55 tok (suffix 13), ttft 5.4s, total 17.1s, decode 2.73 tok/s
+[decode] turn 3: prompt 99 tok (suffix 12), ttft 4.9s, total 16.9s, decode 2.66 tok/s
+[batch] turn 1: prompt 10 tok (suffix 10), ttft 2.6s, total 14.5s, decode 2.69 tok/s
+[batch] turn 2: prompt 55 tok (suffix 13), ttft 5.6s, total 19.3s, decode 2.35 tok/s
+[batch] turn 3: prompt 99 tok (suffix 12), ttft 5.2s, total 19.5s, decode 2.24 tok/s
+turn 1: identical=True  ctrl ttft 3.1s vs batch 2.6s (suffix 10 tok)
+turn 2: identical=True  ctrl ttft 5.4s vs batch 5.6s (suffix 13 tok)
+turn 3: identical=True  ctrl ttft 4.9s vs batch 5.2s (suffix 12 tok)
+GATES-CONV PASS: 3-turn byte-identity (short, chunk 32)

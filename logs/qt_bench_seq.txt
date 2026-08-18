@@ -1,0 +1,61 @@
+=== bench decode short chunk=32 rep=1 12:29:45 ===
+=== bench: arm=decode conv=short chunk=32 max_new=32 ===
+[decode] turn 1: prompt 10 tok (suffix 10), ttft 2.6s, total 14.1s, decode 2.77 tok/s
+[decode] turn 2: prompt 55 tok (suffix 13), ttft 5.4s, total 17.1s, decode 2.73 tok/s
+[decode] turn 3: prompt 99 tok (suffix 12), ttft 4.8s, total 16.7s, decode 2.7 tok/s
+[bench] saved logs/qt_bench/decode_short_c32_r1.json
+=== bench batch short chunk=32 rep=1 12:30:36 ===
+=== bench: arm=batch conv=short chunk=32 max_new=32 ===
+[batch] turn 1: prompt 10 tok (suffix 10), ttft 3.1s, total 14.8s, decode 2.73 tok/s
+[batch] turn 2: prompt 55 tok (suffix 13), ttft 5.7s, total 18.7s, decode 2.46 tok/s
+[batch] turn 3: prompt 99 tok (suffix 12), ttft 5.6s, total 19.6s, decode 2.29 tok/s
+[bench] saved logs/qt_bench/batch_short_c32_r1.json
+=== bench batch short chunk=32 rep=2 12:31:34 ===
+=== bench: arm=batch conv=short chunk=32 max_new=32 ===
+[batch] turn 1: prompt 10 tok (suffix 10), ttft 3.1s, total 14.8s, decode 2.74 tok/s
+[batch] turn 2: prompt 55 tok (suffix 13), ttft 5.7s, total 19.0s, decode 2.41 tok/s
+[batch] turn 3: prompt 99 tok (suffix 12), ttft 5.5s, total 19.4s, decode 2.3 tok/s
+[bench] saved logs/qt_bench/batch_short_c32_r2.json
+=== bench decode short chunk=32 rep=2 12:32:31 ===
+=== bench: arm=decode conv=short chunk=32 max_new=32 ===
+[decode] turn 1: prompt 10 tok (suffix 10), ttft 3.3s, total 15.3s, decode 2.67 tok/s
+[decode] turn 2: prompt 55 tok (suffix 13), ttft 5.6s, total 17.5s, decode 2.69 tok/s
+[decode] turn 3: prompt 99 tok (suffix 12), ttft 4.9s, total 16.9s, decode 2.66 tok/s
+[bench] saved logs/qt_bench/decode_short_c32_r2.json
+=== bench decode long chunk=32 rep=1 12:33:25 ===
+=== bench: arm=decode conv=long chunk=32 max_new=32 ===
+[decode] turn 1: prompt 65 tok (suffix 65), ttft 15.8s, total 80.5s, decode 0.49 tok/s
+[decode] turn 2: prompt 168 tok (suffix 71), ttft 67.4s, total 97.4s, decode 1.07 tok/s
+[decode] turn 3: prompt 265 tok (suffix 65), ttft 62.0s, total 89.5s, decode 1.16 tok/s
+[bench] saved logs/qt_bench/decode_long_c32_r1.json
+=== bench batch long chunk=32 rep=1 12:37:59 ===
+=== bench: arm=batch conv=long chunk=32 max_new=32 ===
+[batch] turn 1: prompt 65 tok (suffix 65), ttft 18.4s, total 83.6s, decode 0.49 tok/s
+[batch] turn 2: prompt 168 tok (suffix 71), ttft 46.2s, total 70.7s, decode 1.3 tok/s
+[batch] turn 3: prompt 265 tok (suffix 65), ttft 38.6s, total 61.1s, decode 1.42 tok/s
+[bench] saved logs/qt_bench/batch_long_c32_r1.json
+=== bench batch long chunk=32 rep=2 12:41:40 ===
+=== bench: arm=batch conv=long chunk=32 max_new=32 ===
+[batch] turn 1: prompt 65 tok (suffix 65), ttft 16.8s, total 83.1s, decode 0.48 tok/s
+[batch] turn 2: prompt 168 tok (suffix 71), ttft 45.9s, total 68.5s, decode 1.42 tok/s
+[batch] turn 3: prompt 265 tok (suffix 65), ttft 39.5s, total 64.9s, decode 1.26 tok/s
+[bench] saved logs/qt_bench/batch_long_c32_r2.json
+=== bench decode long chunk=32 rep=2 12:45:22 ===
+=== bench: arm=decode conv=long chunk=32 max_new=32 ===
+[decode] turn 1: prompt 65 tok (suffix 65), ttft 15.8s, total 82.6s, decode 0.48 tok/s
+[decode] turn 2: prompt 168 tok (suffix 71), ttft 66.7s, total 96.6s, decode 1.07 tok/s
+[decode] turn 3: prompt 265 tok (suffix 65), ttft 61.8s, total 90.3s, decode 1.12 tok/s
+[bench] saved logs/qt_bench/decode_long_c32_r2.json
+=== bench batch long chunk=16 rep=1 12:49:58 ===
+=== bench: arm=batch conv=long chunk=16 max_new=32 ===
+[batch] turn 1: prompt 65 tok (suffix 65), ttft 16.3s, total 81.6s, decode 0.49 tok/s
+[batch] turn 2: prompt 168 tok (suffix 71), ttft 50.3s, total 81.3s, decode 1.03 tok/s
+[batch] turn 3: prompt 265 tok (suffix 65), ttft 44.6s, total 75.1s, decode 1.05 tok/s
+[bench] saved logs/qt_bench/batch_long_c16_r1.json
+=== bench batch long chunk=8 rep=1 12:54:02 ===
+=== bench: arm=batch conv=long chunk=8 max_new=32 ===
+[batch] turn 1: prompt 65 tok (suffix 65), ttft 17.9s, total 84.1s, decode 0.48 tok/s
+[batch] turn 2: prompt 168 tok (suffix 71), ttft 57.9s, total 88.9s, decode 1.03 tok/s
+[batch] turn 3: prompt 265 tok (suffix 65), ttft 52.7s, total 78.8s, decode 1.22 tok/s
+[bench] saved logs/qt_bench/batch_long_c8_r1.json
+=== bench sequence done 12:58:20 ===

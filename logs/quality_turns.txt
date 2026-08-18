@@ -1,0 +1,14 @@
+=== quality-turns work session 2026-08-17 12:17:43 ===
+goal: batched teacher-forced suffix append (kv_append.append_tokens) to cut turn-2+ TTFT
+code: streaming/kv_append.py (new), chat.py suffix path (DSV4_SUFFIX_APPEND=batch default, =decode control)
+plan: gates-edge -> gates-conv -> bench (2 reps x {decode,batch} x {short,long}) -> chunk sweep -> serve.py API test
+[2026-08-17 12:27:21] GATES-EDGE PASS (3/3, logits bitwise identical + next-8-greedy identical):
+e1_one_token_suffix: prefix 15 suffix 1 chunk 32 | logits bitwise=True argmax=True next-8-greedy identical=True | append 1.0s, case 26.3s -> PASS
+e2_ring_wrap_span128: prefix 120 suffix 16 chunk 8 | logits bitwise=True argmax=True next-8-greedy identical=True | append 48.5s, case 297.8s -> PASS
+e3_mid_window_30tok: prefix 40 suffix 30 chunk 32 | logits bitwise=True argmax=True next-8-greedy identical=True | append 42.6s, case 213.8s -> PASS
+[2026-08-17 12:29:24] GATES-CONV PASS (3-turn short conv, greedy chat, decode control first, chunk 32):
+turn 1: identical=True  ctrl ttft 3.1s vs batch 2.6s (suffix 10 tok)
+turn 2: identical=True  ctrl ttft 5.4s vs batch 5.6s (suffix 13 tok)
+turn 3: identical=True  ctrl ttft 4.9s vs batch 5.2s (suffix 12 tok)
+GATES-CONV PASS: 3-turn byte-identity (short, chunk 32)
+note: warm single-process A/B shows TTFT parity on 12-13-tok suffixes (decode already ~2.7 tok/s in-process); honest numbers from isolated bench next
